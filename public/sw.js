@@ -1,8 +1,11 @@
 // Service worker: guarda la app para abrirla sin conexión.
 // Estrategia "red primero": siempre intenta traer la versión nueva y solo usa la copia guardada si no hay red,
 // así nunca se queda atascada una versión vieja. Las llamadas a /api no se guardan.
-const CACHE = 'notas-v6';
-const SHELL = ['./', 'index.html', 'app.css', 'app.js', 'theme.js', 'store.js', 'sync.js', 'favicon.svg', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png'];
+const VERSION = '__V__'; // el servidor lo sustituye por el id del despliegue
+const CACHE = `notas-${VERSION}`;
+const SHELL = ['./', 'app.css', 'app.js', 'theme.js', 'store.js', 'sync.js', 'manifest.webmanifest']
+  .map((f) => (f === './' ? f : `${f}?v=${VERSION}`))
+  .concat(['favicon.svg', 'icons/icon-192.png', 'icons/icon-512.png']);
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

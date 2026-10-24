@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import fs from 'node:fs';
 
 const scrypt = promisify(crypto.scrypt);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -39,6 +40,17 @@ await pool.query(`
   ALTER TABLE notes ADD COLUMN IF NOT EXISTS kind  text NOT NULL DEFAULT 'note';
   ALTER TABLE notes ADD COLUMN IF NOT EXISTS paper text NOT NULL DEFAULT 'blank';
   CREATE INDEX IF NOT EXISTS notes_user_updated_idx ON notes (user_id, pinned DESC, updated_at DESC);
+  CREATE TABLE IF NOT EXISTS files (
+    id         uuid PRIMARY KEY,
+    user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name       text NOT NULL,
+    type       text NOT NULL,
+    size       integer NOT NULL,
+    embedded   boolean NOT NULL DEFAULT false,
+    data       bytea NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+  );
+  CREATE INDEX IF NOT EXISTS files_user_idx ON files (user_id, created_at DESC);
   DELETE FROM sessions WHERE expires_at < now();
 `);
 
@@ -138,7 +150,8 @@ app.use((req, res, next) => {
   res.setHeader('Referrer-Policy', 'same-origin');
   res.setHeader(
     'Content-Security-Policy',
-    "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'"
+    "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self' blob:; " +
+      "style-src 'self'; script-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"
   );
   next();
 });
@@ -147,15 +160,67 @@ app.use(express.json({ limit: '30mb' }));
 
 // Bloquea peticiones de escritura que no sean JSON (mitiga CSRF junto con SameSite=Lax).
 app.use('/api', (req, res, next) => {
+  if (req.method === 'PUT' && req.path.startsWith('/files/')) return next(); // binario; protegido igual por SameSite=Lax
   if (req.method !== 'GET' && req.method !== 'DELETE' && !req.is('application/json')) {
     return res.status(415).json({ error: 'Content-Type debe ser application/json' });
   }
   next();
 });
 
-// Siempre revalida (ETag): evita que Safari/PWA siga mostrando una versión vieja de la app.
-app.use(express.static(path.join(__dirname, 'public'), {
-  setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache'),
+// ----- archivos de la app -----
+// Cada despliegue tiene un identificador (hash del contenido de public/). El HTML y los módulos JS
+// referencian los recursos como "archivo?v=__V__", y aquí se sustituye __V__ por ese identificador.
+// Así un CDN o el navegador nunca mezclan el HTML nuevo con un CSS/JS viejo guardado en caché.
+const PUBLIC = path.join(__dirname, 'public');
+
+function hashDir(dir) {
+  const h = crypto.createHash('sha256');
+  const walk = (d) => {
+    for (const name of fs.readdirSync(d).sort()) {
+      const p = path.join(d, name);
+      if (fs.statSync(p).isDirectory()) walk(p);
+      else h.update(name).update(fs.readFileSync(p));
+    }
+  };
+  walk(dir);
+  return h.digest('hex').slice(0, 10);
+}
+const BUILD = hashDir(PUBLIC);
+
+const TEMPLATED = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
+};
+const templates = new Map();
+
+app.use((req, res, next) => {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+  const rel = req.path === '/' ? '/index.html' : req.path;
+  const type = TEMPLATED[path.extname(rel)];
+  if (!type) return next();
+  const file = path.join(PUBLIC, path.normalize(rel));
+  if (!file.startsWith(PUBLIC + path.sep)) return next();
+  let entry = templates.get(file);
+  if (!entry) {
+    let body;
+    try { body = fs.readFileSync(file, 'utf8').replaceAll('__V__', BUILD); } catch { return next(); }
+    entry = { body, etag: `"${crypto.createHash('sha1').update(body).digest('base64url').slice(0, 20)}"` };
+    templates.set(file, entry);
+  }
+  res.setHeader('Content-Type', type);
+  res.setHeader('ETag', entry.etag);
+  res.setHeader('Cache-Control', req.query.v === BUILD ? 'public, max-age=31536000, immutable' : 'no-cache');
+  if (req.headers['if-none-match'] === entry.etag) return res.status(304).end();
+  res.send(entry.body);
+});
+
+app.use(express.static(PUBLIC, {
+  cacheControl: false,
+  setHeaders: (res) => {
+    // Con ?v=<build> el recurso nunca cambia; sin él, se revalida siempre.
+    res.setHeader('Cache-Control', res.req.query.v === BUILD ? 'public, max-age=31536000, immutable' : 'no-cache');
+  },
 }));
 
 // ----- auth -----
@@ -378,14 +443,85 @@ app.delete('/api/notes/:id', requireUser, async (req, res, next) => {
   }
 });
 
+// ----- archivos (importados e imágenes insertadas en lienzos) -----
+
+const FILE_COLUMNS = 'id, name, type, size, embedded, created_at';
+// Tipos que se pueden mostrar en línea sin riesgo; el resto se descarga como adjunto.
+const INLINE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf', 'text/plain']);
+
+app.get('/api/files', requireUser, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT ${FILE_COLUMNS} FROM files WHERE user_id = $1 ORDER BY created_at DESC LIMIT 2000`,
+      [req.user.id]
+    );
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Crea un archivo con id del cliente (sincronización sin conexión). Reintentar es seguro.
+app.put('/api/files/:id', requireUser, express.raw({ type: () => true, limit: '30mb' }), async (req, res, next) => {
+  try {
+    if (!isUuid(req.params.id)) return res.status(404).json({ error: 'No encontrado' });
+    if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'Archivo vacío' });
+    let name = 'archivo';
+    try { name = decodeURIComponent(String(req.get('X-File-Name') || 'archivo')); } catch {}
+    name = name.replace(/[\u0000-\u001f\\/]/g, '_').slice(0, 200) || 'archivo';
+    const rawType = String(req.get('X-File-Type') || '').toLowerCase();
+    const type = /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(rawType) ? rawType : 'application/octet-stream';
+    const embedded = req.get('X-Embedded') === '1';
+    const ins = await pool.query(
+      `INSERT INTO files (id, user_id, name, type, size, embedded, data) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (id) DO NOTHING RETURNING ${FILE_COLUMNS}`,
+      [req.params.id, req.user.id, name, type, req.body.length, embedded, req.body]
+    );
+    if (ins.rows[0]) return res.status(201).json(ins.rows[0]);
+    const cur = await pool.query(`SELECT ${FILE_COLUMNS} FROM files WHERE id = $1 AND user_id = $2`, [req.params.id, req.user.id]);
+    if (!cur.rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    res.json(cur.rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/files/:id', requireUser, async (req, res, next) => {
+  try {
+    if (!isUuid(req.params.id)) return res.status(404).json({ error: 'No encontrado' });
+    const { rows } = await pool.query(`SELECT name, type, data FROM files WHERE id = $1 AND user_id = $2`, [req.params.id, req.user.id]);
+    const f = rows[0];
+    if (!f) return res.status(404).json({ error: 'No encontrado' });
+    const inline = INLINE_TYPES.has(f.type);
+    res.setHeader('Content-Type', inline ? f.type : 'application/octet-stream');
+    res.setHeader('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(f.name)}`);
+    // El contenido lo sube el usuario: nunca se ejecuta como página de la app.
+    res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox");
+    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable'); // los archivos no cambian
+    res.send(f.data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete('/api/files/:id', requireUser, async (req, res, next) => {
+  try {
+    if (!isUuid(req.params.id)) return res.status(404).json({ error: 'No encontrado' });
+    await pool.query(`DELETE FROM files WHERE id = $1 AND user_id = $2`, [req.params.id, req.user.id]);
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.use('/api', (req, res) => res.status(404).json({ error: 'No encontrado' }));
 
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
-  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'La nota es demasiado grande' });
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'Demasiado grande (máximo 30 MB)' });
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'JSON inválido' });
   console.error(err);
   res.status(500).json({ error: 'Error del servidor' });
 });
 
-app.listen(PORT, () => console.log(`Notas listo en http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`Notas listo en http://localhost:${PORT} (build ${BUILD})`));

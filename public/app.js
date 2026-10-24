@@ -1,5 +1,7 @@
-import { openStore, newLocalNote, fromServer } from './store.js';
-import { createSync } from './sync.js';
+import { openStore, newLocalNote, newLocalFile } from './store.js?v=__V__';
+import { createSync } from './sync.js?v=__V__';
+
+const BUILD = '__V__'; // el servidor lo sustituye por el id del despliegue
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -81,7 +83,6 @@ const DEFAULT_SHEET_H = { note: 1.3, canvas: 1.7 };
 // ---------- Estado ----------
 
 const state = {
-  notes: [],
   current: null,        // { id, title, body, pinned, kind, paper }
   items: [],            // trazos, formas y stickers
   undo: [],
@@ -96,7 +97,10 @@ const state = {
   sticker: '⭐',
   fingerDraws: false,
   query: '',
-  pendingIds: new Set(), // notas con cambios sin sincronizar
+  filter: 'all',        // all | note | canvas | file
+  notes: [],            // resúmenes de notas y lienzos
+  entries: [],          // lo que muestra el inicio (notas, lienzos y archivos)
+  pendingIds: new Set(), // con cambios sin sincronizar
 };
 const dirty = new Set();
 let saveTimer = null;
@@ -118,12 +122,15 @@ function savePrefs() {
 
 const els = {
   auth: $('#auth'), app: $('#app'), authForm: $('#auth-form'), authError: $('#auth-error'),
-  list: $('#note-list'), search: $('#search'), whoami: $('#whoami'),
-  empty: $('#empty'), noteView: $('#note-view'), sheet: $('#sheet'), scroller: $('#scroller'),
+  hub: $('#hub'), hubBody: $('#hub-body'), search: $('#search'), userBtn: $('#user-btn'), net: $('#net'),
+  importBtn: $('#import-btn'), importInput: $('#import-input'), imageInput: $('#image-input'), dropHint: $('#drop-hint'),
+  floatMenu: $('#float-menu'), toast: $('#toast'),
+  noteView: $('#note-view'), sheet: $('#sheet'), scroller: $('#scroller'), back: $('#back'),
   title: $('#title'), ctitle: $('#ctitle'), body: $('#body'), canvas: $('#canvas'), live: $('#live'), status: $('#status'),
-  pin: $('#pin'), undo: $('#undo'), redo: $('#redo'), finger: $('#finger'),
-  pop: $('#pop'), selUi: $('#sel-ui'), paperPicker: $('#paper-picker'), colorBtn: $('#color-btn'),
-  newMenu: $('#new-menu'), newBtn: $('#new-note'), net: $('#net'), toast: $('#toast'),
+  pin: $('#pin'), deleteBtn: $('#delete'), exportBtn: $('#export-btn'), undo: $('#undo'), redo: $('#redo'), finger: $('#finger'),
+  pop: $('#pop'), selUi: $('#sel-ui'), paperPicker: $('#paper-picker'), colorBtn: $('#color-btn'), insertImage: $('#insert-image'),
+  fileView: $('#file-view'), fileBody: $('#file-body'), fileName: $('#file-name'), fileBack: $('#file-back'),
+  fileSave: $('#file-save'), fileDelete: $('#file-delete'), fileAnnotate: $('#file-annotate'),
 };
 const ctx = els.canvas.getContext('2d');
 const lctx = els.live.getContext('2d');
@@ -174,10 +181,11 @@ els.authForm.addEventListener('submit', async (e) => {
 
 let store = null;       // almacén local del usuario actual
 let sync = null;        // motor de sincronización
+let currentUser = null;
 let netState = { s: 'idle', pending: 0 };
 let lastEditAt = -Infinity; // momento de la última edición (para no pisar lo que se está escribiendo)
 
-$('#logout').addEventListener('click', async () => {
+async function logout() {
   await flush().catch(() => {});
   if (!navigator.onLine) {
     alert('Necesitas conexión para cerrar sesión: así no se pierden cambios sin sincronizar.');
@@ -204,24 +212,54 @@ $('#logout').addEventListener('click', async () => {
   try { localStorage.removeItem('lastUser'); } catch {}
   await teardown({ wipe: true }); // se borran las copias locales de este dispositivo
   showAuth();
-});
+}
 
 async function teardown({ wipe = false } = {}) {
   sync?.stop();
   sync = null;
   if (store && wipe) await store.destroy();
   store = null;
+  clearImageCache();
+  thumbCache.clear();
+  cardEls.clear();
+}
+
+// Subida y descarga binaria de archivos (las usa la sincronización)
+async function uploadFile(id, f) {
+  const res = await fetch(`/api/files/${id}`, {
+    method: 'PUT',
+    credentials: 'same-origin',
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'X-File-Name': encodeURIComponent(f.name),
+      'X-File-Type': f.type,
+      'X-Embedded': f.embedded ? '1' : '0',
+    },
+    body: f.blob,
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => null);
+    throw Object.assign(new Error(data?.error || 'Error'), { status: res.status, data });
+  }
+}
+
+async function downloadFile(id) {
+  const res = await fetch(`/api/files/${id}`, { credentials: 'same-origin' });
+  if (!res.ok) throw Object.assign(new Error('Error'), { status: res.status });
+  return res.blob();
 }
 
 async function startApp(user) {
+  currentUser = user;
   try { localStorage.setItem('lastUser', JSON.stringify(user)); } catch {}
   await teardown();
   store = await openStore(user.id);
-  sync = createSync({ store, api, uuid, hooks: syncHooks });
+  sync = createSync({ store, api, upload: uploadFile, download: downloadFile, uuid, hooks: syncHooks });
   els.auth.hidden = true;
   els.app.hidden = false;
-  els.whoami.textContent = `@${user.username}`;
-  closeNote();
+  els.userBtn.textContent = (user.username[0] || '?').toUpperCase();
+  state.current = null;
+  setView('hub');
   await loadNotes();
   sync.schedule({ pull: true, ms: 0 });
 }
@@ -234,16 +272,28 @@ const syncHooks = {
   },
   onListChanged: () => loadNotes().catch(() => {}),
   onNoteReplaced(id) {
+    thumbCache.delete(id);
     if (state.current?.id === id) refreshOpenNote(id);
   },
   onNoteRemoved(id) {
-    if (state.current?.id === id) closeNote();
+    if (state.current?.id === id) closeNote().catch(() => {});
+  },
+  onFileRemoved(id) {
+    if (currentFileId === id) closeFile();
+  },
+  onFileReady(id) {
+    // Llegó una imagen: se repintan el lienzo abierto y las miniaturas que la usan.
+    imageCache.delete(id);
+    if (state.items.some((it) => it.t === 'image' && it.f === id)) redraw();
+    thumbCache.clear();
+    for (const el of cardEls.values()) el.dataset.sig = '';
+    renderHub();
   },
   onNotice: (msg) => showToast(msg),
   isEditing: (id) => state.current?.id === id && (dirty.size > 0 || active !== null || performance.now() - lastEditAt < 4000),
 };
 
-// Indicador de conexión / sincronización en la cabecera de la lista
+// Indicador de conexión / sincronización en la cabecera
 function renderNet() {
   const { s, pending } = netState;
   const n = pending ? ` · ${pending} pendiente${pending === 1 ? '' : 's'}` : '';
@@ -279,7 +329,42 @@ setInterval(() => {
   if (document.visibilityState === 'visible' && navigator.onLine) sync?.schedule({ pull: true, ms: 0 });
 }, 45000);
 
-// ---------- Lista ----------
+// ---------- Vistas y transiciones ----------
+
+const supportsVT = typeof document.startViewTransition === 'function';
+if (!supportsVT) document.documentElement.classList.add('no-vt');
+const reduceMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function setView(view) {
+  els.app.dataset.view = view;
+  els.hub.hidden = view !== 'hub';
+  els.noteView.hidden = view !== 'note';
+  els.fileView.hidden = view !== 'file';
+}
+
+// Cambia de vista con View Transitions; si se indica, un elemento se "transforma" en otro (tarjeta ⇄ hoja).
+function transition(update, { morphFrom = null, morphTo = null } = {}) {
+  if (!supportsVT || reduceMotion() || document.visibilityState !== 'visible') return Promise.resolve(update());
+  const root = document.documentElement;
+  const target = () => (typeof morphTo === 'function' ? morphTo() : morphTo);
+  root.classList.add('vt-view');
+  if (morphFrom) morphFrom.style.viewTransitionName = 'morph';
+  const t = document.startViewTransition(async () => {
+    if (morphFrom) morphFrom.style.viewTransitionName = '';
+    await update();
+    const el = target();
+    if (el) el.style.viewTransitionName = 'morph';
+  });
+  t.finished.catch(() => {}).finally(() => {
+    root.classList.remove('vt-view');
+    const el = target();
+    if (el) el.style.viewTransitionName = '';
+    if (morphFrom) morphFrom.style.viewTransitionName = '';
+  });
+  return t.updateCallbackDone.catch(() => {});
+}
+
+// ---------- Inicio: notas, lienzos y archivos ----------
 
 const dateFmt = new Intl.DateTimeFormat('es', { day: 'numeric', month: 'short' });
 const timeFmt = new Intl.DateTimeFormat('es', { hour: '2-digit', minute: '2-digit' });
@@ -299,82 +384,336 @@ function svgIcon(name, cls) {
   return svg;
 }
 
+const el = (tag, cls, text) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+};
+
 const noteTitle = (n) => n.title.trim() || (n.kind === 'canvas' ? 'Lienzo sin título' : 'Sin título');
-const noteMeta = (n) =>
-  `${formatDate(n.sortAt)}  ${n.preview.replace(/\s+/g, ' ').trim() || (n.kind === 'canvas' ? 'Lienzo' : 'Sin texto adicional')}`;
+const KIND = {
+  note: { label: 'Nota', icon: 'type' },
+  canvas: { label: 'Lienzo', icon: 'canvas' },
+  file: { label: 'Archivo', icon: 'file' },
+};
 
-function renderList() {
-  els.list.replaceChildren();
-  if (!state.notes.length) {
-    const li = document.createElement('li');
-    li.className = 'list-empty';
-    li.textContent = state.query ? 'Sin resultados' : 'Aún no tienes notas';
-    els.list.append(li);
-    return;
-  }
-  for (const n of state.notes) {
-    const li = document.createElement('li');
-    const btn = document.createElement('button');
-    btn.className = 'note-item' + (state.current?.id === n.id ? ' on' : '');
-    btn.dataset.id = n.id;
-
-    const row = document.createElement('div');
-    row.className = 'row';
-    const t = document.createElement('span');
-    t.className = 't';
-    t.textContent = noteTitle(n);
-    row.append(t);
-    if (n.kind === 'canvas') row.append(svgIcon('canvas'));
-    else if (n.has_drawing) row.append(svgIcon('pen'));
-    if (n.pinned) row.append(svgIcon('pin', 'pin-ic'));
-    if (n.pending) {
-      const dot = document.createElement('i');
-      dot.className = 'pend' + (n.syncError ? ' err' : '');
-      dot.title = n.syncError ? `No se pudo sincronizar: ${n.syncError}` : 'Pendiente de sincronizar';
-      row.append(dot);
-    }
-
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    meta.textContent = noteMeta(n);
-
-    btn.append(row, meta);
-    btn.addEventListener('click', () => openNote(n.id));
-    li.append(btn);
-    els.list.append(li);
-  }
+function formatSize(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-// La lista sale del almacén local (funciona sin conexión); la sincronización lo mantiene al día.
+const fileExt = (name) => (name.match(/\.([a-z0-9]{1,5})$/i)?.[1] || 'archivo').toUpperCase();
+
+function fileEntry(f) {
+  return {
+    id: f.id, kind: 'file', title: f.name, type: f.type, size: f.size, preview: '', pinned: false,
+    pending: f.isNew, syncError: f.syncError, hasBlob: Boolean(f.hasBlob),
+    sortAt: f.localAt || Date.parse(f.created_at), search: f.name.toLowerCase(),
+  };
+}
+
+// El inicio sale del almacén local (funciona sin conexión); la sincronización lo mantiene al día.
 let loadSeq = 0;
 async function loadNotes() {
   if (!store) return;
   const seq = ++loadSeq;
-  const all = await store.items();
+  const [items, files] = await Promise.all([store.items(), store.files()]);
   if (seq !== loadSeq) return;
-  state.pendingIds = new Set(all.filter((i) => i.pending).map((i) => i.id));
-  const q = state.query.toLowerCase();
-  state.notes = (q ? all.filter((i) => i.search.includes(q)) : all).sort((a, b) => b.pinned - a.pinned || b.sortAt - a.sortAt);
-  renderList();
+  state.pendingIds = new Set([...items.filter((i) => i.pending).map((i) => i.id), ...files.filter((f) => f.isNew).map((f) => f.id)]);
+  state.notes = items;
+  state.entries = [...items, ...files.filter((f) => !f.embedded).map(fileEntry)];
+  renderHub();
   updateStatus();
 }
 
+const cardEls = new Map(); // id → tarjeta (se reutilizan: así solo se animan las nuevas)
+const thumbCache = new Map(); // id → { key, url } miniaturas del dibujo
+let thumbQueue = Promise.resolve();
+
+const themeKey = () => getComputedStyle(document.documentElement).getPropertyValue('--ink').trim();
+
+function renderHub() {
+  const q = state.query.toLowerCase();
+  const matches = state.entries.filter((e) => !q || e.search.includes(q));
+  const counts = { all: matches.length, note: 0, canvas: 0, file: 0 };
+  for (const e of matches) counts[e.kind]++;
+  $$('#filters button').forEach((b) => {
+    b.classList.toggle('on', b.dataset.filter === state.filter);
+    b.setAttribute('aria-selected', String(b.dataset.filter === state.filter));
+    $('.count', b).textContent = counts[b.dataset.filter] ? String(counts[b.dataset.filter]) : '';
+  });
+
+  const list = matches.filter((e) => state.filter === 'all' || e.kind === state.filter).sort((a, b) => b.sortAt - a.sortAt);
+  if (!list.length) {
+    cardEls.clear();
+    const empty = el('div', 'hub-empty');
+    empty.append(svgIcon(q ? 'search' : 'scribble'));
+    empty.append(el('p', null, q ? 'Sin resultados' : state.filter === 'file' ? 'Aún no tienes archivos. Usa “Importar” o arrástralos aquí.' : 'Aún no hay nada aquí. Crea una nota o un lienzo.'));
+    els.hubBody.replaceChildren(empty);
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  const seen = new Set();
+  let i = 0;
+  const section = (title, entries) => {
+    if (!entries.length) return;
+    const grid = el('div', 'grid');
+    for (const e of entries) {
+      grid.append(cardFor(e, i++));
+      seen.add(e.id);
+    }
+    frag.append(el('h2', 'section-title', title), grid);
+  };
+  const pinned = list.filter((e) => e.pinned);
+  section('Fijadas', pinned);
+  section('Recientes', list.filter((e) => !e.pinned));
+  for (const id of [...cardEls.keys()]) if (!seen.has(id)) cardEls.delete(id);
+  els.hubBody.replaceChildren(frag);
+}
+
+function cardFor(e, i) {
+  let card = cardEls.get(e.id);
+  const sig = [e.kind, e.title, e.preview, e.pinned, e.pending, e.syncError, e.sortAt, e.paper, e.rev, e.hasBlob, themeKey()].join('|');
+  if (card && card.dataset.sig === sig) return card;
+  if (!card) {
+    card = el('div', 'card enter');
+    card.tabIndex = 0;
+    card.setAttribute('role', 'button');
+    card.dataset.id = e.id;
+    card.style.setProperty('--i', String(Math.min(i, 14)));
+    card.addEventListener('animationend', () => card.classList.remove('enter'), { once: true });
+    card.addEventListener('click', (ev) => {
+      if (!ev.target.closest('.card-more')) openEntry(card.dataset.id, card);
+    });
+    card.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') openEntry(card.dataset.id, card); });
+    card.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      openCardMenu(card.dataset.id, card);
+    });
+    cardEls.set(e.id, card);
+  }
+  card.dataset.sig = sig;
+  card.dataset.kind = e.kind;
+
+  const thumb = el('div', 'thumb');
+  if (e.kind === 'file') {
+    if (e.type.startsWith('image/')) {
+      const img = el('img', 'photo');
+      img.alt = '';
+      img.decoding = 'async';
+      thumb.append(img);
+      loadImage(e.id).then((im) => { img.src = im.src; img.classList.add('ready'); }).catch(() => {
+        img.replaceWith(fileIcon(e));
+      });
+    } else {
+      thumb.append(fileIcon(e));
+    }
+  } else {
+    if (e.kind === 'canvas') thumb.dataset.paper = e.paper || 'blank';
+    if (e.kind === 'note') {
+      const text = el('div', 'text', e.preview);
+      thumb.append(text);
+    }
+    if (e.has_drawing) {
+      const ink = el('img', 'ink');
+      ink.alt = '';
+      thumb.append(ink);
+      thumbFor(e).then((url) => { if (url) { ink.src = url; ink.classList.add('ready'); } }).catch(() => {});
+    }
+  }
+
+  const tag = el('span', 'kind-tag');
+  tag.append(svgIcon(KIND[e.kind].icon), document.createTextNode(e.kind === 'file' ? fileExt(e.title) : KIND[e.kind].label));
+
+  const title = el('div', 'card-title');
+  title.append(el('span', null, e.kind === 'file' ? e.title : noteTitle(e)));
+  if (e.pinned) title.append(svgIcon('pin', 'pin-ic'));
+  if (e.pending) {
+    const dot = el('i', 'pend' + (e.syncError ? ' err' : ''));
+    dot.title = e.syncError ? `No se pudo sincronizar: ${e.syncError}` : 'Pendiente de sincronizar';
+    title.append(dot);
+  }
+  const meta = el('div', 'card-meta', e.kind === 'file' ? `${formatDate(e.sortAt)} · ${formatSize(e.size)}` : formatDate(e.sortAt));
+  const info = el('div', 'card-info');
+  info.append(title, meta);
+
+  const more = el('button', 'card-more');
+  more.type = 'button';
+  more.title = 'Más opciones';
+  more.setAttribute('aria-label', 'Más opciones');
+  more.setAttribute('aria-haspopup', 'menu');
+  more.append(svgIcon('more'));
+  more.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    openCardMenu(e.id, more);
+  });
+
+  card.replaceChildren(thumb, tag, info, more);
+  return card;
+}
+
+function fileIcon(e) {
+  const wrap = el('div', 'file-ic');
+  wrap.append(svgIcon('file'), el('span', 'file-ext', fileExt(e.title)));
+  return wrap;
+}
+
+// Miniatura del dibujo (se genera en segundo plano, una por una, y se guarda en memoria)
+function thumbFor(e) {
+  const key = `${e.rev}|${themeKey()}`;
+  const hit = thumbCache.get(e.id);
+  if (hit?.key === key) return Promise.resolve(hit.url);
+  const job = thumbQueue.then(async () => {
+    const again = thumbCache.get(e.id);
+    if (again?.key === key) return again.url;
+    const note = await store?.get(e.id);
+    if (!note?.drawing?.strokes?.length) return null;
+    const c = await renderDrawing(note.drawing.strokes, { width: 360, height: 270 });
+    const url = c.toDataURL('image/png');
+    thumbCache.set(e.id, { key, url });
+    return url;
+  });
+  thumbQueue = job.catch(() => {});
+  return job;
+}
+
+// Filtros y búsqueda
+$$('#filters button').forEach((b) =>
+  b.addEventListener('click', () => {
+    state.filter = b.dataset.filter;
+    renderHub();
+  })
+);
 let searchTimer;
 els.search.addEventListener('input', () => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => {
     state.query = els.search.value.trim();
-    loadNotes().catch(() => {});
-  }, 250);
+    renderHub();
+  }, 150);
 });
 
-// Menú "nuevo": nota o lienzo
-function toggleNewMenu(open = els.newMenu.hidden) {
-  els.newMenu.hidden = !open;
-  els.newBtn.setAttribute('aria-expanded', String(open));
+$$('[data-new]').forEach((b) => b.addEventListener('click', () => createNote(b.dataset.new).catch(() => {})));
+els.importBtn.addEventListener('click', () => els.importInput.click());
+els.importInput.addEventListener('change', () => {
+  const files = [...els.importInput.files];
+  els.importInput.value = '';
+  if (files.length) importFiles(files);
+});
+
+// Arrastrar y soltar archivos en el inicio
+let dragDepth = 0;
+const draggingFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+document.addEventListener('dragenter', (e) => {
+  if (!draggingFiles(e) || els.app.hidden || els.app.dataset.view !== 'hub') return;
+  dragDepth++;
+  els.dropHint.hidden = false;
+});
+document.addEventListener('dragleave', () => {
+  if (dragDepth && --dragDepth === 0) els.dropHint.hidden = true;
+});
+document.addEventListener('dragover', (e) => { if (draggingFiles(e) && els.app.dataset.view === 'hub') e.preventDefault(); });
+document.addEventListener('drop', (e) => {
+  if (!draggingFiles(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  els.dropHint.hidden = true;
+  if (els.app.dataset.view === 'hub' && e.dataTransfer.files.length) importFiles([...e.dataTransfer.files]);
+});
+
+async function openEntry(id, card) {
+  const entry = state.entries.find((e) => e.id === id);
+  if (!entry) return;
+  if (entry.kind === 'file') return openFile(id, card);
+  return openNote(id, { from: card });
 }
-els.newBtn.addEventListener('click', () => toggleNewMenu());
+
+// ---------- Menús flotantes ----------
+
+let menuAnchor = null;
+
+function openMenu(anchor, items) {
+  if (!els.floatMenu.hidden && menuAnchor === anchor) return closeMenu();
+  menuAnchor = anchor;
+  const m = els.floatMenu;
+  m.replaceChildren();
+  for (const it of items) {
+    if (it.head) {
+      const head = el('div', 'menu-head');
+      head.append(el('strong', null, it.head));
+      if (it.sub) head.append(el('small', 'muted', it.sub));
+      m.append(head);
+      continue;
+    }
+    const b = el('button', it.danger ? 'danger' : '');
+    b.type = 'button';
+    b.setAttribute('role', 'menuitem');
+    b.append(svgIcon(it.icon));
+    const label = el('span', null, it.label);
+    if (it.sub) label.append(el('small', null, it.sub));
+    b.append(label);
+    b.addEventListener('click', () => {
+      closeMenu();
+      it.action();
+    });
+    m.append(b);
+  }
+  m.hidden = false;
+  const r = anchor.getBoundingClientRect();
+  const left = Math.min(innerWidth - m.offsetWidth - 8, Math.max(8, r.right - m.offsetWidth));
+  let top = r.bottom + 8;
+  if (top + m.offsetHeight > innerHeight - 8) top = Math.max(8, r.top - m.offsetHeight - 8);
+  m.style.left = `${left}px`;
+  m.style.top = `${top}px`;
+}
+
+function closeMenu() {
+  els.floatMenu.hidden = true;
+  menuAnchor = null;
+}
+
+document.addEventListener('pointerdown', (e) => {
+  if (!els.floatMenu.hidden && !e.target.closest('#float-menu') && !(menuAnchor && menuAnchor.contains(e.target))) closeMenu();
+  if (!els.pop.hidden && !e.target.closest('#pop, .toolbar')) closePop();
+});
+addEventListener('resize', closeMenu);
+
+els.userBtn.addEventListener('click', () =>
+  openMenu(els.userBtn, [
+    { head: `@${currentUser?.username ?? ''}`, sub: `Versión ${BUILD}` },
+    { icon: 'download', label: 'Exportar copia de seguridad', sub: 'Notas, lienzos y archivos (.json)', action: exportBackup },
+    { icon: 'upload', label: 'Importar', sub: 'Archivos, textos o copias de seguridad', action: () => els.importInput.click() },
+    { icon: 'logout', label: 'Cerrar sesión', danger: true, action: logout },
+  ])
+);
+
+function openCardMenu(id, anchor) {
+  const entry = state.entries.find((e) => e.id === id);
+  if (!entry) return;
+  if (entry.kind === 'file') {
+    return openMenu(anchor, [
+      { icon: 'file', label: 'Abrir', action: () => openFile(id) },
+      { icon: 'download', label: 'Descargar o compartir', action: () => saveFile(id) },
+      ...(entry.type.startsWith('image/') ? [{ icon: 'pen', label: 'Anotar en un lienzo', action: () => annotateImage(id) }] : []),
+      { icon: 'trash', label: 'Eliminar', danger: true, action: () => deleteFile(id) },
+    ]);
+  }
+  openMenu(anchor, [
+    { icon: KIND[entry.kind].icon, label: 'Abrir', action: () => openNote(id) },
+    { icon: 'pin', label: entry.pinned ? 'Quitar de fijadas' : 'Fijar', action: () => togglePin(id) },
+    { icon: 'copy', label: 'Duplicar', action: () => duplicateNote(id) },
+    { icon: 'share', label: 'Exportar…', action: () => openMenu(anchor, exportOptions(id, entry.kind)) },
+    { icon: 'trash', label: 'Eliminar', danger: true, action: () => deleteNote(id) },
+  ]);
+}
+
+// ---------- Crear, abrir y cerrar ----------
+
 async function createNote(kind) {
+  if (!store) return;
   await flush().catch(() => {});
   const note = newLocalNote(uuid(), kind);
   await store.put(note);
@@ -383,59 +722,51 @@ async function createNote(kind) {
   if (kind === 'canvas') openPop('pen'); // muestra lápices y colores al crear un lienzo
   sync.schedule();
 }
-$$('button', els.newMenu).forEach((b) =>
-  b.addEventListener('click', () => {
-    toggleNewMenu(false);
-    createNote(b.dataset.kind).catch(() => {});
-  })
-);
-document.addEventListener('pointerdown', (e) => {
-  if (!els.newMenu.hidden && !e.target.closest('#new-menu, #new-note')) toggleNewMenu(false);
-  if (!els.pop.hidden && !e.target.closest('#pop, .toolbar')) closePop();
-});
-
-// ---------- Editor ----------
 
 // keepView: recarga el contenido (p. ej. llegó una versión nueva de otro dispositivo) sin mover la hoja ni la herramienta.
-async function openNote(id, { focusTitle = false, keepView = false } = {}) {
+async function openNote(id, { focusTitle = false, keepView = false, from = null } = {}) {
   await flush().catch(() => {});
   const note = await store.get(id);
   if (!note) return;
   const scrollTop = els.scroller.scrollTop;
-  state.current = { id: note.id, title: note.title, body: note.body, pinned: note.pinned, kind: note.kind, paper: note.paper };
-  state.items = Array.isArray(note.drawing?.strokes) ? note.drawing.strokes : [];
-  state.undo = [];
-  state.redo = [];
-  state.sel = null;
-  liveItem = null;
-  dirty.clear();
-  if (!keepView) closePop();
 
-  const canvasKind = note.kind === 'canvas';
-  els.noteView.dataset.kind = note.kind;
-  els.title.value = els.ctitle.value = note.title;
-  els.body.value = note.body;
-  els.ctitle.hidden = !canvasKind;
-  els.paperPicker.hidden = !canvasKind;
-  els.sheet.dataset.paper = canvasKind ? note.paper : 'blank';
-  syncPaperPicker();
-  els.sheet.style.setProperty('--sheet-h', String(note.drawing?.h ?? DEFAULT_SHEET_H[note.kind]));
-  els.pin.setAttribute('aria-pressed', String(note.pinned));
-  updateStatus();
+  const apply = () => {
+    state.current = { id: note.id, title: note.title, body: note.body, pinned: note.pinned, kind: note.kind, paper: note.paper };
+    state.items = Array.isArray(note.drawing?.strokes) ? note.drawing.strokes : [];
+    state.undo = [];
+    state.redo = [];
+    state.sel = null;
+    liveItem = null;
+    dirty.clear();
+    if (!keepView) closePop();
 
-  els.empty.hidden = true;
-  els.noteView.hidden = false;
-  els.app.dataset.view = 'note';
-  els.scroller.scrollTop = keepView ? scrollTop : 0;
-  autoGrow();
-  if (!keepView) {
-    if (canvasKind) setTool(state.tool === 'text' ? 'pen' : state.tool);
-    else setTool(state.items.length && !note.body ? 'pen' : 'text');
-  }
-  syncCanvasSize();
-  updateHistoryButtons();
-  renderList();
-  if (focusTitle && !canvasKind && state.tool === 'text') els.title.focus();
+    const canvasKind = note.kind === 'canvas';
+    els.noteView.dataset.kind = note.kind;
+    els.noteView.dataset.id = note.id;
+    els.title.value = els.ctitle.value = note.title;
+    els.body.value = note.body;
+    els.ctitle.hidden = !canvasKind;
+    els.paperPicker.hidden = !canvasKind;
+    els.sheet.dataset.paper = canvasKind ? note.paper : 'blank';
+    syncPaperPicker();
+    els.sheet.style.setProperty('--sheet-h', String(note.drawing?.h ?? DEFAULT_SHEET_H[note.kind]));
+    els.pin.setAttribute('aria-pressed', String(note.pinned));
+    updateStatus();
+
+    setView('note');
+    els.scroller.scrollTop = keepView ? scrollTop : 0;
+    autoGrow();
+    if (!keepView) {
+      if (canvasKind) setTool(state.tool === 'text' ? 'pen' : state.tool);
+      else setTool(state.items.length && !note.body ? 'pen' : 'text');
+    }
+    syncCanvasSize();
+    updateHistoryButtons();
+  };
+
+  if (keepView || els.app.dataset.view === 'note') apply();
+  else await transition(apply, { morphFrom: from?.querySelector('.thumb') ?? null, morphTo: els.sheet });
+  if (focusTitle && note.kind !== 'canvas' && state.tool === 'text') els.title.focus();
 }
 
 // Llegó una versión nueva de la nota abierta: se recarga solo si no se está editando.
@@ -444,19 +775,18 @@ function refreshOpenNote(id) {
   openNote(id, { keepView: true }).catch(() => {});
 }
 
-function closeNote() {
-  state.current = null;
-  els.noteView.hidden = true;
-  els.empty.hidden = false;
-  els.app.dataset.view = 'list';
-  closePop();
-  renderList();
+async function closeNote() {
+  await flush().catch(() => {});
+  const id = state.current?.id;
+  await transition(() => {
+    state.current = null;
+    closePop();
+    setView('hub');
+    renderHub();
+  }, { morphFrom: els.sheet, morphTo: () => cardEls.get(id)?.querySelector('.thumb') });
 }
 
-$('#back').addEventListener('click', async () => {
-  await flush().catch(() => {});
-  closeNote();
-});
+els.back.addEventListener('click', () => closeNote().catch(() => {}));
 
 function autoGrow() {
   els.body.style.height = 'auto';
@@ -466,7 +796,6 @@ function autoGrow() {
 function onTitleInput(value, source) {
   state.current.title = value;
   (source === els.title ? els.ctitle : els.title).value = value;
-  patchListItem({ title: value });
   markDirty('title');
 }
 els.title.addEventListener('input', () => onTitleInput(els.title.value, els.title));
@@ -477,20 +806,9 @@ els.title.addEventListener('keydown', (e) => {
 });
 els.body.addEventListener('input', () => {
   state.current.body = els.body.value;
-  patchListItem({ preview: els.body.value.slice(0, 140) });
   autoGrow();
   markDirty('body');
 });
-
-function patchListItem(patch) {
-  const n = state.notes.find((x) => x.id === state.current?.id);
-  if (!n) return;
-  Object.assign(n, patch);
-  const item = $(`.note-item[data-id="${n.id}"]`);
-  if (!item) return;
-  if ('title' in patch) $('.t', item).textContent = noteTitle(n);
-  if ('preview' in patch) $('.meta', item).textContent = noteMeta(n);
-}
 
 els.pin.addEventListener('click', () => {
   state.current.pinned = !state.current.pinned;
@@ -498,18 +816,480 @@ els.pin.addEventListener('click', () => {
   markDirty('pinned');
 });
 
-$('#delete').addEventListener('click', async () => {
-  if (!state.current || !confirm(`¿Eliminar ${isCanvasKind() ? 'este lienzo' : 'esta nota'}?`)) return;
-  const id = state.current.id;
-  clearTimeout(saveTimer);
-  dirty.clear();
-  const note = await store.get(id);
-  await store.remove(id);
-  if (note && !note.isNew) await store.markDeleted(id); // el borrado se envía al servidor al sincronizar
-  closeNote();
+els.deleteBtn.addEventListener('click', () => { if (state.current) deleteNote(state.current.id); });
+els.exportBtn.addEventListener('click', () => {
+  if (state.current) openMenu(els.exportBtn, exportOptions(state.current.id, state.current.kind));
+});
+
+// Cambia campos de una nota que no está abierta (fijar desde el inicio, etc.)
+async function updateNote(id, patch) {
+  if (state.current?.id === id) {
+    for (const [k, v] of Object.entries(patch)) {
+      state.current[k] = v;
+      markDirty(k);
+    }
+    if ('pinned' in patch) els.pin.setAttribute('aria-pressed', String(patch.pinned));
+    return flush();
+  }
+  const n = await store.get(id);
+  if (!n) return;
+  Object.assign(n, patch);
+  n.dirty = [...new Set([...n.dirty, ...Object.keys(patch)])];
+  n.rev += 1;
+  n.syncError = null;
+  await store.put(n);
   await loadNotes();
   sync.schedule();
+}
+
+async function togglePin(id) {
+  const n = await store.get(id);
+  if (n) await updateNote(id, { pinned: !n.pinned });
+}
+
+async function duplicateNote(id) {
+  await flush().catch(() => {});
+  const n = await store.get(id);
+  if (!n) return;
+  const copy = newLocalNote(uuid(), n.kind);
+  Object.assign(copy, { title: `${noteTitle(n)} (copia)`, body: n.body, drawing: n.drawing, paper: n.paper });
+  await store.put(copy);
+  await loadNotes();
+  sync.schedule();
+  showToast('Duplicado');
+}
+
+async function deleteNote(id) {
+  const note = await store.get(id);
+  if (!note || !confirm(`¿Eliminar ${note.kind === 'canvas' ? 'este lienzo' : 'esta nota'}?`)) return;
+  const open = state.current?.id === id;
+  if (open) {
+    clearTimeout(saveTimer);
+    dirty.clear();
+  }
+  await store.remove(id);
+  if (!note.isNew) await store.markDeleted(id); // el borrado se envía al servidor al sincronizar
+  thumbCache.delete(id);
+  if (open) await closeNote();
+  await loadNotes();
+  sync.schedule();
+}
+
+// ---------- Archivos ----------
+
+let currentFileId = null;
+let fileUrl = null;
+
+// El tipo guardado en el registro manda (el servidor puede devolver algunos como octet-stream)
+const typed = (blob, type) => (blob.type === type ? blob : new Blob([blob], { type }));
+
+async function fileBlob(id) {
+  const f = await store.getFile(id);
+  if (!f) return null;
+  if (f.blob) return typed(f.blob, f.type);
+  const blob = await downloadFile(id);
+  await store.putFile({ ...f, blob });
+  return typed(blob, f.type);
+}
+
+async function openFile(id, from = null) {
+  const f = await store.getFile(id);
+  if (!f) return;
+  await flush().catch(() => {});
+  currentFileId = id;
+  await transition(() => {
+    state.current = null;
+    els.fileName.textContent = f.name;
+    els.fileAnnotate.hidden = !f.type.startsWith('image/');
+    els.fileBody.replaceChildren(el('div', 'file-empty', 'Cargando…'));
+    setView('file');
+  }, { morphFrom: from?.querySelector('.thumb') ?? null, morphTo: els.fileBody });
+
+  let blob;
+  try {
+    blob = await fileBlob(id);
+  } catch {
+    if (currentFileId !== id) return;
+    const msg = el('div', 'file-empty');
+    msg.append(svgIcon('file'), el('p', null, 'Este archivo aún no está en este dispositivo. Ábrelo con conexión para guardarlo y verlo sin conexión.'));
+    els.fileBody.replaceChildren(msg);
+    return;
+  }
+  if (currentFileId !== id || !blob) return;
+  if (fileUrl) URL.revokeObjectURL(fileUrl);
+  fileUrl = URL.createObjectURL(blob);
+
+  const t = f.type;
+  let view;
+  if (t.startsWith('image/')) {
+    view = el('img');
+    view.alt = f.name;
+    view.src = fileUrl;
+  } else if (t === 'application/pdf') {
+    // Vista integrada + botón al visor nativo (en iPad muestra todas las páginas y permite buscar).
+    view = el('div', 'pdf-view');
+    const frame = el('iframe');
+    frame.title = f.name;
+    frame.src = fileUrl;
+    const open = el('button', 'pill-btn glass-pill pdf-open');
+    open.type = 'button';
+    open.append(svgIcon('share'), el('span', null, 'Abrir PDF'));
+    open.addEventListener('click', () => window.open(fileUrl, '_blank'));
+    view.append(frame, open);
+  } else if (t.startsWith('video/')) {
+    view = el('video');
+    view.controls = true;
+    view.playsInline = true;
+    view.src = fileUrl;
+  } else if (t.startsWith('audio/')) {
+    view = el('audio');
+    view.controls = true;
+    view.src = fileUrl;
+  } else if (t.startsWith('text/') || /json|xml|markdown|csv/.test(t) || /\.(txt|md|csv|json|log)$/i.test(f.name)) {
+    view = el('pre');
+    blob.slice(0, 2e6).text().then((x) => (view.textContent = x));
+  } else {
+    view = el('div', 'file-empty');
+    const btn = el('button', 'primary', 'Descargar');
+    btn.type = 'button';
+    btn.addEventListener('click', () => saveFile(id));
+    view.append(svgIcon('file'), el('p', null, `No hay vista previa para este tipo de archivo (${fileExt(f.name)}).`), btn);
+  }
+  els.fileBody.replaceChildren(view);
+}
+
+function closeFile() {
+  const id = currentFileId;
+  currentFileId = null;
+  transition(() => {
+    setView('hub');
+    renderHub();
+  }, { morphFrom: els.fileBody, morphTo: () => cardEls.get(id)?.querySelector('.thumb') }).then(() => {
+    if (fileUrl) URL.revokeObjectURL(fileUrl);
+    fileUrl = null;
+    els.fileBody.replaceChildren();
+  });
+}
+
+async function saveFile(id) {
+  const f = await store.getFile(id);
+  try {
+    const blob = await fileBlob(id);
+    if (blob) await deliver(blob, f.name);
+  } catch {
+    showToast('Este archivo no está disponible sin conexión.');
+  }
+}
+
+async function deleteFile(id) {
+  const f = await store.getFile(id);
+  if (!f || !confirm(`¿Eliminar “${f.name}”?`)) return;
+  await store.removeFile(id);
+  if (!f.isNew) await store.markDeleted(id, 'file');
+  imageCache.delete(id);
+  if (currentFileId === id) closeFile();
+  await loadNotes();
+  sync.schedule();
+}
+
+els.fileBack.addEventListener('click', closeFile);
+els.fileSave.addEventListener('click', () => currentFileId && saveFile(currentFileId));
+els.fileDelete.addEventListener('click', () => currentFileId && deleteFile(currentFileId));
+els.fileAnnotate.addEventListener('click', () => currentFileId && annotateImage(currentFileId));
+
+// Reduce fotos grandes antes de guardarlas en un lienzo (menos datos que sincronizar).
+async function downscaleImage(blob, max = 2400) {
+  let bmp;
+  try { bmp = await createImageBitmap(blob); } catch { return blob; }
+  const s = Math.min(1, max / Math.max(bmp.width, bmp.height));
+  if (s === 1 && blob.size < 3e6) {
+    bmp.close?.();
+    return blob;
+  }
+  const c = document.createElement('canvas');
+  c.width = Math.round(bmp.width * s);
+  c.height = Math.round(bmp.height * s);
+  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+  bmp.close?.();
+  const type = blob.type === 'image/png' ? 'image/png' : 'image/jpeg';
+  return new Promise((resolve) => c.toBlob((b) => resolve(b || blob), type, 0.88));
+}
+
+// Guarda una imagen como archivo incrustado y devuelve su id y proporción.
+async function embedImage(blob, name) {
+  const small = await downscaleImage(blob);
+  const id = uuid();
+  await store.putFile(newLocalFile(id, { name: name || 'imagen.jpg', type: small.type || 'image/jpeg', blob: small, embedded: true }));
+  const img = await loadImage(id);
+  return { id, ratio: img.naturalHeight / img.naturalWidth };
+}
+
+async function insertImage(file) {
+  if (!state.current) return;
+  try {
+    const { id, ratio } = await embedImage(file, file.name);
+    const w = Math.min(0.6, 0.8 / ratio);
+    const h = w * ratio;
+    const y = els.scroller.scrollTop / els.sheet.offsetWidth + 0.06;
+    const item = { t: 'image', f: id, x: round4((1 - w) / 2), y: round4(y), w: round4(w), h: round4(h) };
+    pushUndo();
+    state.items = [...state.items, item];
+    state.sel = state.items.length - 1;
+    redraw();
+    setTool('select');
+    commitDrawing();
+  } catch (err) {
+    console.error(err);
+    showToast('No se pudo insertar la imagen.');
+  }
+}
+els.insertImage.addEventListener('click', () => els.imageInput.click());
+els.imageInput.addEventListener('change', () => {
+  const file = els.imageInput.files[0];
+  els.imageInput.value = '';
+  if (file) insertImage(file);
 });
+
+// Crea un lienzo con la imagen para escribir encima
+async function annotateImage(fileId) {
+  try {
+    const f = await store.getFile(fileId);
+    const blob = await fileBlob(fileId);
+    const { id, ratio } = await embedImage(blob, f.name);
+    const w = 0.9;
+    const h = w * ratio;
+    const note = newLocalNote(uuid(), 'canvas');
+    note.title = f.name.replace(/\.[^.]+$/, '');
+    note.drawing = { v: 2, h: Math.max(DEFAULT_SHEET_H.canvas, round4(h + 0.15)), strokes: [{ t: 'image', f: id, x: 0.05, y: 0.05, w, h: round4(h) }] };
+    await store.put(note);
+    await loadNotes();
+    await openNote(note.id);
+    sync.schedule();
+  } catch (err) {
+    console.error(err);
+    showToast('No se pudo abrir la imagen para anotar.');
+  }
+}
+
+// ---------- Importar ----------
+
+function base64ToBlob(b64, type) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: type || 'application/octet-stream' });
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(',')[1] || '');
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+function parseText(text, filename) {
+  const m = text.match(/^\s*#\s+(.+)\r?\n?/);
+  if (m) return { title: m[1].trim().slice(0, 300), body: text.slice(m[0].length).replace(/^\s*\n/, '') };
+  return { title: filename.replace(/\.[^.]+$/, '').slice(0, 300), body: text };
+}
+
+// Copia de seguridad o nota exportada (.notas.json). Todo se importa con ids nuevos.
+async function importPackage(data) {
+  const fileMap = new Map();
+  let files = 0, notes = 0;
+  for (const f of Array.isArray(data.files) ? data.files : []) {
+    if (!f?.data) continue;
+    const id = uuid();
+    fileMap.set(f.id, id);
+    await store.putFile(newLocalFile(id, { name: String(f.name || 'archivo'), type: String(f.type || ''), blob: base64ToBlob(f.data, f.type), embedded: Boolean(f.embedded) }));
+    if (!f.embedded) files++;
+  }
+  for (const n of Array.isArray(data.notes) ? data.notes : []) {
+    const rec = newLocalNote(uuid(), n?.kind === 'canvas' ? 'canvas' : 'note');
+    rec.title = String(n?.title ?? '').slice(0, 300);
+    rec.body = String(n?.body ?? '');
+    rec.pinned = Boolean(n?.pinned);
+    rec.paper = ['blank', 'grid', 'lined', 'dots'].includes(n?.paper) ? n.paper : 'blank';
+    if (n?.drawing && Array.isArray(n.drawing.strokes)) {
+      rec.drawing = { ...n.drawing, strokes: n.drawing.strokes.map((it) => (it?.t === 'image' ? { ...it, f: fileMap.get(it.f) ?? it.f } : it)) };
+    }
+    await store.put(rec);
+    notes++;
+  }
+  return { notes, files };
+}
+
+const MAX_FILE = 30 * 1024 * 1024;
+
+async function importFiles(list) {
+  if (!store) return;
+  let notes = 0, files = 0;
+  const failed = [];
+  for (const file of list) {
+    try {
+      const lower = file.name.toLowerCase();
+      if (lower.endsWith('.json') && file.size < 200 * 1024 * 1024) {
+        let data = null;
+        try { data = JSON.parse(await file.text()); } catch {}
+        if (data?.app === 'notas') {
+          const r = await importPackage(data);
+          notes += r.notes;
+          files += r.files;
+          continue;
+        }
+      }
+      if (/\.(md|markdown|txt)$/.test(lower) && file.size < 5 * 1024 * 1024) {
+        const { title, body } = parseText(await file.text(), file.name);
+        const n = newLocalNote(uuid(), 'note');
+        n.title = title;
+        n.body = body;
+        await store.put(n);
+        notes++;
+        continue;
+      }
+      if (file.size > MAX_FILE) {
+        failed.push(`${file.name} (más de 30 MB)`);
+        continue;
+      }
+      await store.putFile(newLocalFile(uuid(), { name: file.name, type: file.type, blob: file }));
+      files++;
+    } catch (err) {
+      console.error(err);
+      failed.push(file.name);
+    }
+  }
+  await loadNotes();
+  sync?.schedule();
+  const parts = [];
+  if (notes) parts.push(`${notes} nota${notes === 1 ? '' : 's'}`);
+  if (files) parts.push(`${files} archivo${files === 1 ? '' : 's'}`);
+  showToast([parts.length ? `Importado: ${parts.join(' y ')}.` : '', failed.length ? `No se pudo importar: ${failed.join(', ')}.` : ''].filter(Boolean).join(' ') || 'Nada que importar.');
+}
+
+// ---------- Exportar ----------
+
+const safeName = (s) => (s.replace(/[\\/:*?"<>|\u0000-\u001f]+/g, ' ').trim().slice(0, 80) || 'nota');
+
+// Entrega un archivo: hoja de compartir en iPad/iPhone (Guardar en Archivos, AirDrop…) o descarga normal.
+async function deliver(blob, name) {
+  const file = new File([blob], name, { type: blob.type || 'application/octet-stream' });
+  if (matchMedia('(pointer: coarse)').matches && navigator.canShare?.({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: name });
+      return;
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+    }
+  }
+  const url = URL.createObjectURL(file);
+  const a = el('a');
+  a.href = url;
+  a.download = name;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+// Empaqueta notas (y los archivos que usan, o todos) en un .json que se puede volver a importar.
+async function notesPackage(notes, { allFiles = false } = {}) {
+  const used = new Set();
+  for (const n of notes) for (const it of n.drawing?.strokes ?? []) if (it.t === 'image') used.add(it.f);
+  const chosen = (await store.files()).filter((f) => allFiles || used.has(f.id));
+  const parts = [
+    `{"app":"notas","version":1,"exported_at":${JSON.stringify(new Date().toISOString())},"notes":`,
+    JSON.stringify(notes.map((n) => ({ id: n.id, kind: n.kind, paper: n.paper, title: n.title, body: n.body, drawing: n.drawing, pinned: n.pinned }))),
+    ',"files":[',
+  ];
+  let first = true, missing = 0;
+  for (const f of chosen) {
+    let blob = f.hasBlob ? (await store.getFile(f.id))?.blob : null;
+    if (!blob) {
+      try { blob = await downloadFile(f.id); } catch { missing++; continue; }
+    }
+    const head = JSON.stringify({ id: f.id, name: f.name, type: f.type, embedded: f.embedded });
+    parts.push(`${first ? '' : ','}${head.slice(0, -1)},"data":"${await blobToBase64(blob)}"}`);
+    first = false;
+  }
+  parts.push(']}');
+  return { blob: new Blob(parts, { type: 'application/json' }), missing };
+}
+
+async function exportBackup() {
+  if (!store) return;
+  await flush().catch(() => {});
+  showToast('Preparando copia de seguridad…');
+  const notes = (await Promise.all((await store.items()).map((i) => store.get(i.id)))).filter(Boolean);
+  const { blob, missing } = await notesPackage(notes, { allFiles: true });
+  await deliver(blob, `notas-copia-${new Date().toISOString().slice(0, 10)}.notas.json`);
+  showToast(missing ? `Copia lista. ${missing} archivo(s) no se incluyeron porque no están en este dispositivo.` : 'Copia de seguridad lista.');
+}
+
+function exportOptions(id, kind) {
+  const opts = [];
+  if (kind === 'canvas') opts.push({ icon: 'image', label: 'Imagen PNG', sub: 'Para compartir o imprimir', action: () => exportNote(id, 'png') });
+  opts.push({ icon: 'file', label: 'PDF', sub: 'Desde el diálogo de impresión', action: () => exportNote(id, 'pdf') });
+  if (kind === 'note') opts.push({ icon: 'type', label: 'Texto (.md)', sub: 'Solo el texto', action: () => exportNote(id, 'md') });
+  opts.push({ icon: 'download', label: 'Archivo de Notas (.json)', sub: 'Se puede volver a importar', action: () => exportNote(id, 'json') });
+  return opts;
+}
+
+function contentBottom(items) {
+  return items.reduce((m, it) => Math.max(m, bounds(it).y1), 0);
+}
+
+async function exportNote(id, format) {
+  await flush().catch(() => {});
+  const note = await store.get(id);
+  if (!note) return;
+  const name = safeName(noteTitle(note));
+  try {
+    if (format === 'json') {
+      const { blob } = await notesPackage([note]);
+      return deliver(blob, `${name}.notas.json`);
+    }
+    if (format === 'md') {
+      return deliver(new Blob([`# ${noteTitle(note)}\n\n${note.body}\n`], { type: 'text/markdown' }), `${name}.md`);
+    }
+    if (format === 'png') {
+      const items = note.drawing?.strokes ?? [];
+      const sheetH = note.drawing?.h ?? DEFAULT_SHEET_H[note.kind];
+      const h = Math.min(sheetH, Math.max(0.75, contentBottom(items) + 0.06));
+      const W = Math.round(Math.min(1800, Math.sqrt(14e6 / h))); // sin pasar el límite de canvas de Safari
+      const c = await renderDrawing(items, {
+        width: W, height: Math.round(W * h), ink: '#14171f', background: '#ffffff',
+        paper: note.kind === 'canvas' ? note.paper : null, paperColor: 'rgba(20, 23, 31, 0.12)',
+      });
+      const blob = await new Promise((resolve) => c.toBlob(resolve, 'image/png'));
+      return deliver(blob, `${name}.png`);
+    }
+    if (format === 'pdf') {
+      if (state.current?.id !== id) await openNote(id);
+      printSheet();
+    }
+  } catch (err) {
+    console.error(err);
+    showToast('No se pudo exportar.');
+  }
+}
+
+// PDF: se imprime solo la hoja (en iPad: Imprimir → Compartir → Guardar en Archivos).
+function printSheet() {
+  const pref = themePref();
+  const dark = document.documentElement.dataset.theme === 'dark' || (pref === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
+  if (dark) applyTheme('light', { save: false });
+  const textCopy = el('div', 'print-body', els.body.value); // el textarea no crece al imprimir: se imprime una copia
+  els.body.after(textCopy);
+  const restore = () => {
+    removeEventListener('afterprint', restore);
+    textCopy.remove();
+    if (dark) applyTheme(pref, { save: false });
+  };
+  addEventListener('afterprint', restore);
+  setTimeout(() => window.print(), 60);
+}
 
 // Papel del lienzo
 function syncPaperPicker() {
@@ -573,7 +1353,7 @@ function flush() {
       for (const f of fields) note[f] = f === 'drawing' ? drawingPayload() : state.current[f];
       note.dirty = [...new Set([...note.dirty, ...fields])];
       note.rev += 1;
-      note.localAt = Date.now();
+      if (fields.some((f) => f !== 'pinned')) note.localAt = Date.now();
       note.syncError = null;
       await store.put(note);
     } catch (err) {
@@ -647,7 +1427,7 @@ function setColor(c) {
   if (['text', 'eraser'].includes(state.tool)) setTool('pen');
   if (state.tool === 'select' && state.sel != null) {
     const it = state.items[state.sel];
-    if (it && it.t !== 'sticker') {
+    if (it && it.t !== 'sticker' && it.t !== 'image') {
       pushUndo();
       state.items = state.items.map((x, i) => (i === state.sel ? { ...x, c } : x));
       redraw();
@@ -839,6 +1619,7 @@ function bounds(it) {
 }
 
 function computeBounds(it) {
+  if (it.t === 'image') return { x0: it.x, y0: it.y, x1: it.x + it.w, y1: it.y + it.h };
   if (it.t === 'sticker') {
     const { w, h } = stickerSize(it);
     return { x0: it.x - w / 2, y0: it.y - h / 2, x1: it.x + w / 2, y1: it.y + h / 2 };
@@ -880,6 +1661,7 @@ function nearPolyline(pts, closed, x, y, r) {
 // interior: también cuenta el interior de formas rellenas y stickers (para seleccionar)
 function hitItem(it, x, y, r, interior) {
   if (!inBounds(bounds(it), x, y, r + 0.02)) return false;
+  if (it.t === 'image') return inBounds(bounds(it), x, y, r / 2);
   if (it.t === 'sticker') return inBounds(bounds(it), x, y, r / 2);
   if (it.t === 'shape') {
     const rr = r + it.w / REF_WIDTH / 2;
@@ -913,6 +1695,7 @@ function simplify(pts, eps) {
 }
 
 function mapItem(it, fx, fy, k) {
+  if (it.t === 'image') return { ...it, x: round4(fx(it.x)), y: round4(fy(it.y)), w: round4(it.w * k), h: round4(it.h * k) };
   if (it.t === 'sticker') return { ...it, x: round4(fx(it.x)), y: round4(fy(it.y)), s: it.s * k };
   if (it.t === 'shape') return { ...it, x1: round4(fx(it.x1)), y1: round4(fy(it.y1)), x2: round4(fx(it.x2)), y2: round4(fy(it.y2)) };
   return { ...it, p: it.p.map(([x, y, pr]) => [round4(fx(x)), round4(fy(y)), pr]), w: it.w * k };
@@ -920,7 +1703,8 @@ function mapItem(it, fx, fy, k) {
 
 // ---------- Render ----------
 
-const resolveColor = (c) => (c === 'ink' ? getComputedStyle(document.documentElement).getPropertyValue('--ink').trim() || '#000' : c);
+let inkOverride = null; // color de la tinta "automática" al exportar (siempre oscura sobre blanco)
+const resolveColor = (c) => (c === 'ink' ? inkOverride || getComputedStyle(document.documentElement).getPropertyValue('--ink').trim() || '#000' : c);
 const setNormalized = (c) => c.setTransform(c.canvas.width, 0, 0, c.canvas.width, 0, 0);
 
 function syncCanvasSize() {
@@ -1006,8 +1790,60 @@ function drawSticker(c, it) {
   c.restore();
 }
 
+// Imágenes insertadas: se cargan del dispositivo (o del servidor) y se repinta al llegar.
+const imageCache = new Map(); // id → { img, url, promise, failedAt }
+
+function loadImage(id) {
+  const hit = imageCache.get(id);
+  if (hit && !(hit.failedAt && Date.now() - hit.failedAt > 15000)) return hit.promise;
+  const entry = {};
+  entry.promise = (async () => {
+    const f = await store?.getFile(id);
+    let blob = f?.blob;
+    if (!blob) {
+      blob = await downloadFile(id);
+      if (f) await store.putFile({ ...f, blob });
+    }
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    entry.img = img;
+    entry.url = url;
+    return img;
+  })();
+  entry.promise.catch(() => { entry.failedAt = Date.now(); });
+  imageCache.set(id, entry);
+  return entry.promise;
+}
+
+function clearImageCache() {
+  for (const e of imageCache.values()) if (e.url) URL.revokeObjectURL(e.url);
+  imageCache.clear();
+}
+
+function drawImageItem(c, it) {
+  const W = c.canvas.width;
+  const x = it.x * W, y = it.y * W, w = it.w * W, h = it.h * W;
+  const img = imageCache.get(it.f)?.img;
+  c.save();
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  if (img) {
+    c.drawImage(img, x, y, w, h);
+  } else {
+    c.fillStyle = 'rgba(128, 128, 128, 0.12)';
+    c.fillRect(x, y, w, h);
+    c.strokeStyle = 'rgba(128, 128, 128, 0.45)';
+    c.setLineDash([8, 6]);
+    c.strokeRect(x, y, w, h);
+    if (c === ctx) loadImage(it.f).then(() => { if (state.items.includes(it)) redraw(); }).catch(() => {});
+  }
+  c.restore();
+}
+
 function drawItem(c, it) {
-  if (it.t === 'sticker') drawSticker(c, it);
+  if (it.t === 'image') drawImageItem(c, it);
+  else if (it.t === 'sticker') drawSticker(c, it);
   else if (it.t === 'shape') drawShape(c, it);
   else drawStroke(c, it);
 }
@@ -1032,12 +1868,12 @@ function getGrain() {
 }
 
 // Trazo translúcido: se dibuja opaco en una capa y se compone con la opacidad del lápiz (sin oscurecer los cruces).
-function drawAlphaStroke(it) {
+function drawAlphaStroke(it, target = ctx) {
   const pen = penOf(it);
-  const W = els.canvas.width;
+  const W = target.canvas.width;
   const b = bounds(it);
   const x0 = Math.max(0, Math.floor(b.x0 * W) - 2), y0 = Math.max(0, Math.floor(b.y0 * W) - 2);
-  const x1 = Math.min(els.canvas.width, Math.ceil(b.x1 * W) + 2), y1 = Math.min(els.canvas.height, Math.ceil(b.y1 * W) + 2);
+  const x1 = Math.min(target.canvas.width, Math.ceil(b.x1 * W) + 2), y1 = Math.min(target.canvas.height, Math.ceil(b.y1 * W) + 2);
   const w = x1 - x0, h = y1 - y0;
   if (w <= 0 || h <= 0) return;
   if (layer.width < w) layer.width = w;
@@ -1053,20 +1889,64 @@ function drawAlphaStroke(it) {
     layerCtx.fillRect(x0, y0, w, h);
     layerCtx.globalCompositeOperation = 'source-over';
   }
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.globalAlpha = pen.alpha;
-  ctx.drawImage(layer, 0, 0, w, h, x0, y0, w, h);
-  ctx.globalAlpha = 1;
+  target.setTransform(1, 0, 0, 1, 0, 0);
+  target.globalAlpha = pen.alpha;
+  target.drawImage(layer, 0, 0, w, h, x0, y0, w, h);
+  target.globalAlpha = 1;
 }
 
 // Dibuja solo un objeto recién creado (sin repintar toda la hoja).
-function drawCommitted(it) {
+function drawCommitted(it, target = ctx) {
   if (!it.t && penOf(it).alpha < 1) {
-    drawAlphaStroke(it);
+    drawAlphaStroke(it, target);
   } else {
-    setNormalized(ctx);
-    drawItem(ctx, it);
+    setNormalized(target);
+    drawItem(target, it);
   }
+}
+
+// Papel dibujado en un canvas (para exportar PNG); mismas medidas que en pantalla.
+function drawPaper(g, paper, w, h, color) {
+  const u = w / 26;
+  g.save();
+  g.fillStyle = g.strokeStyle = color;
+  g.lineWidth = Math.max(1, w / 900);
+  g.beginPath();
+  if (paper === 'grid') {
+    for (let x = 0; x <= w; x += u) { g.moveTo(x, 0); g.lineTo(x, h); }
+    for (let y = 0; y <= h; y += u) { g.moveTo(0, y); g.lineTo(w, y); }
+    g.stroke();
+  } else if (paper === 'lined') {
+    for (let y = u * 0.6 + u * 1.35; y <= h; y += u * 1.35) { g.moveTo(0, y); g.lineTo(w, y); }
+    g.stroke();
+  } else if (paper === 'dots') {
+    const r = Math.max(1.2, w / 700);
+    for (let y = u / 2; y <= h; y += u) for (let x = u / 2; x <= w; x += u) { g.moveTo(x + r, y); g.arc(x, y, r, 0, Math.PI * 2); }
+    g.fill();
+  }
+  g.restore();
+}
+
+// Dibuja los objetos en un canvas nuevo (miniaturas y exportación). Espera a que carguen las imágenes.
+async function renderDrawing(items, { width, height, ink = null, background = null, paper = null, paperColor = null }) {
+  await Promise.all(items.filter((it) => it.t === 'image').map((it) => loadImage(it.f).catch(() => null)));
+  const c = document.createElement('canvas');
+  c.width = width;
+  c.height = height;
+  const g = c.getContext('2d');
+  if (background) {
+    g.fillStyle = background;
+    g.fillRect(0, 0, width, height);
+  }
+  if (paper && paper !== 'blank') drawPaper(g, paper, width, height, paperColor || 'rgba(128, 128, 128, 0.2)');
+  const prev = inkOverride;
+  inkOverride = ink;
+  try {
+    for (const it of items) drawCommitted(it, g);
+  } finally {
+    inkOverride = prev;
+  }
+  return c;
 }
 
 function redraw() {
@@ -1192,10 +2072,21 @@ function duplicateSelected() {
   redraw();
   commitDrawing();
 }
+function sendToBack() {
+  const it = state.items[state.sel];
+  if (!it || state.sel === 0) return;
+  pushUndo();
+  state.items = [it, ...state.items.filter((_, i) => i !== state.sel)];
+  state.sel = 0;
+  redraw();
+  commitDrawing();
+}
+$('#sel-back').addEventListener('click', sendToBack);
 $('#sel-del').addEventListener('click', deleteSelected);
 $('#sel-copy').addEventListener('click', duplicateSelected);
 
 document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !els.floatMenu.hidden) return closeMenu();
   if (!state.current || state.tool === 'text') return;
   if (e.target.closest?.('input, textarea')) return;
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
@@ -1282,7 +2173,6 @@ function onCanvasDown(e) {
   if (active) active.t = now;
 }
 els.canvas.addEventListener('pointerdown', onCanvasDown);
-els.canvas.addEventListener('pointermove', (e) => { if (e.pointerType === 'pen') lastPenAt = performance.now(); });
 
 // En una nota, tocar con el Pencil sobre la hoja pasa a dibujar sin tener que cambiar de herramienta.
 els.sheet.addEventListener('pointerdown', (e) => {
@@ -1444,7 +2334,7 @@ function eraseAt(e, rect) {
   const steps = Math.max(1, Math.ceil(Math.hypot(x - from[0], y - from[1]) / (r * 0.6)));
   const samples = [];
   for (let i = 1; i <= steps; i++) samples.push([from[0] + ((x - from[0]) * i) / steps, from[1] + ((y - from[1]) * i) / steps]);
-  const kept = state.items.filter((it) => !samples.some(([sx, sy]) => hitItem(it, sx, sy, r, false)));
+  const kept = state.items.filter((it) => it.t === 'image' || !samples.some(([sx, sy]) => hitItem(it, sx, sy, r, false)));
   if (kept.length === state.items.length) return;
   if (!active.undoPushed) {
     pushUndo();
@@ -1530,6 +2420,46 @@ els.canvas.addEventListener('pointercancel', endAction);
 els.canvas.addEventListener('lostpointercapture', endAction);
 els.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
+// ---------- Rechazo de palma ----------
+// Mientras el Pencil está apoyado o se usó hace muy poco, los toques de la mano se anulan en TODA la app:
+// no desplazan la hoja, no seleccionan texto, no pulsan botones (barra de herramientas, tarjetas…).
+let penDown = false;
+const PALM_MS = 900;
+const palmGuard = () => penDown || performance.now() - lastPenAt < PALM_MS;
+
+document.addEventListener('pointerdown', (e) => {
+  if (e.pointerType === 'pen') {
+    penDown = true;
+    lastPenAt = performance.now();
+  } else if (e.pointerType === 'touch' && palmGuard()) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+}, true);
+for (const type of ['pointerup', 'pointercancel']) {
+  document.addEventListener(type, (e) => {
+    if (e.pointerType === 'pen') {
+      penDown = false;
+      lastPenAt = performance.now();
+    }
+  }, true);
+}
+// También al pasar el Pencil sobre la pantalla (iPad con "hover"): la palma suele apoyarse antes de escribir.
+document.addEventListener('pointermove', (e) => { if (e.pointerType === 'pen') lastPenAt = performance.now(); }, { capture: true, passive: true });
+// Safari: anular el toque de la palma evita el desplazamiento, la lupa de selección y los clics.
+document.addEventListener('touchstart', (e) => {
+  const fingers = [...e.changedTouches].some((t) => t.touchType !== 'stylus');
+  if (fingers && palmGuard()) e.preventDefault();
+}, { capture: true, passive: false });
+// Al dibujar no se selecciona nada (salvo en campos de texto).
+document.addEventListener('selectstart', (e) => {
+  const target = e.target.nodeType === 1 ? e.target : e.target.parentElement;
+  if ((palmGuard() || (els.app.dataset.view === 'note' && state.tool !== 'text')) && !target?.closest('input, textarea')) e.preventDefault();
+});
+document.addEventListener('contextmenu', (e) => {
+  if (els.app.dataset.view === 'note' && state.tool !== 'text' && !e.target.closest?.('input, textarea')) e.preventDefault();
+});
+
 // ---------- Apariencia (automática / clara / oscura) ----------
 
 const themeMeta = $('#theme-meta');
@@ -1543,7 +2473,29 @@ function themePref() {
   }
 }
 
-function applyTheme(mode, { save = true } = {}) {
+// animate + origin: revelado circular desde el botón pulsado (View Transitions) o fundido de colores.
+function applyTheme(mode, { save = true, animate = false, origin = null } = {}) {
+  if (!animate || reduceMotion()) return applyThemeNow(mode, save);
+  const root = document.documentElement;
+  if (supportsVT && document.visibilityState === 'visible') {
+    if (origin) {
+      const r = origin.getBoundingClientRect();
+      const x = r.left + r.width / 2, y = r.top + r.height / 2;
+      root.style.setProperty('--vt-x', `${x}px`);
+      root.style.setProperty('--vt-y', `${y}px`);
+      root.style.setProperty('--vt-r', `${Math.hypot(Math.max(x, innerWidth - x), Math.max(y, innerHeight - y))}px`);
+    }
+    root.classList.add('vt-theme');
+    const t = document.startViewTransition(() => applyThemeNow(mode, save));
+    t.finished.catch(() => {}).finally(() => root.classList.remove('vt-theme'));
+  } else {
+    root.classList.add('theme-anim');
+    applyThemeNow(mode, save);
+    setTimeout(() => root.classList.remove('theme-anim'), 500);
+  }
+}
+
+function applyThemeNow(mode, save) {
   const root = document.documentElement;
   if (mode === 'auto') delete root.dataset.theme;
   else root.dataset.theme = mode;
@@ -1558,8 +2510,9 @@ function applyTheme(mode, { save = true } = {}) {
   themeMeta.content = getComputedStyle(root).getPropertyValue('--bg').trim(); // barra de estado / ventana de la PWA
   redraw(); // la tinta "automática" cambia de color con el tema
   renderLive();
+  if (store) renderHub(); // miniaturas con la tinta del tema nuevo
 }
-$$('#theme-picker button').forEach((b) => b.addEventListener('click', () => applyTheme(b.dataset.themeMode)));
+$$('#theme-picker button').forEach((b) => b.addEventListener('click', () => applyTheme(b.dataset.themeMode, { animate: true, origin: b })));
 applyTheme(themePref(), { save: false });
 
 // ---------- PWA ----------

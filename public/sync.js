@@ -6,9 +6,11 @@
 //    la versión del servidor en la nota original y la versión local como una copia nueva "(conflicto)".
 //    Así nunca se pierde texto ni dibujos.
 
-import { ALL_FIELDS, fromServer } from './store.js';
+import { ALL_FIELDS, fromServer } from './store.js?v=__V__';
 
-const MAX_LIST = 500; // el servidor devuelve como máximo 500 notas: con ese tope no se puede saber qué se borró
+const MAX_LIST = 500;   // el servidor devuelve como máximo 500 notas: con ese tope no se puede saber qué se borró
+const MAX_FILES = 2000;
+const PREFETCH_MAX = 20 * 1024 * 1024; // archivos de hasta 20 MB se descargan para tenerlos sin conexión
 
 async function pool(list, size, fn) {
   const queue = [...list];
@@ -17,7 +19,8 @@ async function pool(list, size, fn) {
   }));
 }
 
-export function createSync({ store, api, uuid, hooks }) {
+// upload(id, file) sube un archivo; download(id) devuelve su Blob (los dos lanzan { status } como api()).
+export function createSync({ store, api, upload, download, uuid, hooks }) {
   let running = false, again = false, wantPull = false, stopped = false;
   let timer = null, retryTimer = null, delay = 4000;
   let state = 'idle';
@@ -25,8 +28,8 @@ export function createSync({ store, api, uuid, hooks }) {
   const q = (method, url, body) => api(method, url, body, { quiet: true });
 
   async function pendingCount() {
-    const items = await store.items();
-    return items.filter((i) => i.pending && !i.syncError).length + (await store.deleted()).length;
+    const [items, files, deleted] = await Promise.all([store.items(), store.files(), store.deleted()]);
+    return items.filter((i) => i.pending && !i.syncError).length + files.filter((f) => f.isNew && !f.syncError).length + deleted.length;
   }
 
   async function emit(s) {
@@ -77,14 +80,16 @@ export function createSync({ store, api, uuid, hooks }) {
   }
 
   async function push() {
-    for (const id of await store.deleted()) {
+    for (const { id, kind } of await store.deleted()) {
       try {
-        await q('DELETE', `/api/notes/${id}`);
+        await q('DELETE', `/api/${kind === 'file' ? 'files' : 'notes'}/${id}`);
       } catch (err) {
         if (err.status !== 404) throw err;
       }
       await store.unmarkDeleted(id);
     }
+    // Archivos antes que notas: los lienzos pueden tener imágenes que apuntan a ellos.
+    for (const f of (await store.files()).filter((x) => x.isNew && !x.syncError && x.hasBlob)) await pushFile(await store.getFile(f.id));
     const pending = (await store.items()).filter((i) => i.pending && !i.syncError).sort((a, b) => a.sortAt - b.sortAt);
     for (const it of pending) await pushOne(it.id, false);
   }
@@ -133,6 +138,56 @@ export function createSync({ store, api, uuid, hooks }) {
     await store.put(cur);
   }
 
+  async function pushFile(f) {
+    try {
+      await upload(f.id, f);
+    } catch (err) {
+      if (err.status === 400 || err.status === 413) {
+        const why = err.status === 413 ? 'es demasiado grande (máximo 30 MB)' : err.message;
+        await store.putFile({ ...f, syncError: why });
+        hooks.onNotice(`“${f.name}” no se pudo sincronizar: ${why}.`);
+        return;
+      }
+      throw err;
+    }
+    const cur = (await store.files()).find((x) => x.id === f.id);
+    if (!cur) {
+      await store.markDeleted(f.id, 'file'); // se borró mientras se subía
+      again = true;
+      return;
+    }
+    await store.putFile({ ...cur, isNew: false }); // sin `blob`: el contenido guardado no se toca
+  }
+
+  async function pullFiles() {
+    const remote = await q('GET', '/api/files');
+    const local = new Map((await store.files()).map((f) => [f.id, f]));
+    const deleted = new Set((await store.deleted()).map((d) => d.id));
+    const remoteIds = new Set(remote.map((f) => f.id));
+    for (const r of remote) {
+      if (deleted.has(r.id) || local.has(r.id)) continue;
+      await store.putFile({ ...r, hasBlob: false, isNew: false, localAt: Date.parse(r.created_at), syncError: null });
+    }
+    if (remote.length < MAX_FILES) {
+      for (const l of local.values()) {
+        if (!l.isNew && !remoteIds.has(l.id)) {
+          await store.removeFile(l.id);
+          hooks.onFileRemoved(l.id);
+        }
+      }
+    }
+    // Descarga el contenido para poder abrirlos sin conexión.
+    const missing = (await store.files()).filter((f) => !f.hasBlob && !f.isNew && f.size <= PREFETCH_MAX);
+    await pool(missing, 2, async (f) => {
+      const blob = await download(f.id);
+      const cur = (await store.files()).find((x) => x.id === f.id);
+      if (cur && !cur.hasBlob) {
+        await store.putFile({ ...cur, blob });
+        hooks.onFileReady(f.id);
+      }
+    });
+  }
+
   async function resolveConflict(local, server) {
     const title = local.title.trim() || 'Sin título';
     await store.put({
@@ -154,6 +209,7 @@ export function createSync({ store, api, uuid, hooks }) {
   }
 
   async function pull() {
+    await pullFiles();
     const list = await q('GET', '/api/notes');
     const items = await store.items();
     const local = new Map(items.map((i) => [i.id, i]));

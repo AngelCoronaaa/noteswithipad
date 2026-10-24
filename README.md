@@ -19,7 +19,7 @@ Para uso fuera de casa, ponla detrás de HTTPS (Caddy, Nginx, Cloudflare Tunnel�
 
 ## Apariencia
 
-Abajo a la izquierda eliges **Automático** (sigue al sistema), **Claro** u **Oscuro**. Se recuerda en cada dispositivo. El fondo es liso, sin colores.
+Arriba a la derecha eliges **Automático** (sigue al sistema), **Claro** u **Oscuro**, con una animación de revelado. Se recuerda en cada dispositivo. El fondo es liso, sin colores.
 
 ## Instalarla como app (PWA)
 
@@ -42,6 +42,14 @@ Las notas se guardan primero **en el dispositivo** (IndexedDB) y se envían al s
 - Safari no permite sincronizar con la app cerrada: lo pendiente se envía la próxima vez que la abras.
 - La primera vez en un dispositivo hace falta conexión para descargar las notas.
 
+## Inicio, archivos e importar/exportar
+
+- Al entrar ves el **inicio**: tarjetas con vista previa de notas, lienzos y archivos, filtros (Todo / Notas / Lienzos / Archivos), búsqueda y sección de fijadas. El botón **⋯** de cada tarjeta permite fijar, duplicar, exportar o eliminar.
+- **Importar** (botón o arrastrando al inicio): `.txt`/`.md` se convierten en notas, las copias `.notas.json` se restauran completas y cualquier otro archivo (PDF, imágenes, audio, vídeo…) se guarda en **Archivos** (máx. 30 MB). Los archivos también funcionan sin conexión.
+- **Visor de archivos**: imágenes, PDF, texto, audio y vídeo. Las imágenes tienen **Anotar**, que crea un lienzo con la imagen para escribir encima.
+- En un lienzo, el botón de imagen de la barra **inserta una foto**; se puede mover, escalar, enviar al fondo y el borrador no la borra.
+- **Exportar** (botón de compartir en el editor): PNG (lienzos), PDF (diálogo de impresión → Guardar como PDF), Markdown (notas) y `.notas.json`. En el menú de la cuenta: **copia de seguridad** completa.
+
 ## Notas y lienzos
 
 El botón **+** crea:
@@ -58,10 +66,16 @@ El botón **+** crea:
 - **Stickers**: 48 emojis y etiquetas (IDEA, HECHO, URGENTE, TO-DO).
 - **Seleccionar**: mueve, escala (asa en la esquina), duplica, recolorea o elimina cualquier trazo, forma o sticker.
 - **Borrador** de trazos completos, deshacer/rehacer y la hoja crece al dibujar cerca del borde inferior.
+- **Rechazo de palma:** mientras escribes con el Pencil, los toques de la mano no seleccionan texto, no desplazan la hoja y no pulsan botones.
 - En una nota, en modo Texto, Scribble de iPadOS convierte tu escritura a texto.
+
+## Despliegue y caché
+
+Cada vez que arranca, el servidor calcula un identificador del contenido de `public/` y lo añade a las URLs de CSS y JS (`app.css?v=…`). Así un CDN (p. ej. Cloudflare, que por defecto guarda estos archivos 4 h en el navegador) nunca mezcla un HTML nuevo con un CSS o JS viejo. Basta con reiniciar el servidor tras actualizar.
 
 ## Estructura
 
 - `server.js` — API Express + PostgreSQL (usuarios, sesiones, notas). Contraseñas con scrypt, sesiones con cookie HttpOnly.
-- `public/` — frontend sin dependencias ni build.
+- `public/` — frontend sin dependencias ni build: `app.js` (interfaz y dibujo), `store.js` (IndexedDB), `sync.js` (sincronización), `sw.js` (PWA).
+- Tablas: `users`, `sessions`, `notes` y `files` (contenido en `bytea`).
 - Los dibujos se guardan como JSON (`notes.drawing`, `jsonb`) con coordenadas normalizadas, así se ven igual en cualquier pantalla. `notes.kind` distingue nota/lienzo y `notes.paper` guarda el tipo de papel (las tablas existentes se migran solas).

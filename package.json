@@ -7,7 +7,7 @@
   "scripts": {
     "db": "docker compose up -d db",
     "start": "node --env-file-if-exists=.env server.js",
-    "dev": "node --watch --env-file-if-exists=.env server.js"
+    "dev": "node --watch-path=server.js --watch-path=public --env-file-if-exists=.env server.js"
   },
   "engines": {
     "node": ">=22.9"

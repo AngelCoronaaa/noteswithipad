@@ -11,11 +11,11 @@
   <meta name="description" content="Notas y lienzos con Apple Pencil">
   <meta name="theme-color" id="theme-meta" content="#f1f2f5">
   <title>Notas</title>
-  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="manifest" href="manifest.webmanifest?v=__V__">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-  <script src="theme.js"></script>
-  <link rel="stylesheet" href="app.css">
+  <script src="theme.js?v=__V__"></script>
+  <link rel="stylesheet" href="app.css?v=__V__">
 </head>
 <body>
   <svg class="sprite" width="0" height="0" aria-hidden="true">
@@ -46,6 +46,13 @@
       <symbol id="i-grid" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2.5"/><path d="M4 9.3h16M4 14.7h16M9.3 4v16M14.7 4v16"/></symbol>
       <symbol id="i-lines" viewBox="0 0 24 24"><path d="M4 6.5h16M4 12h16M4 17.5h16"/></symbol>
       <symbol id="i-dots" viewBox="0 0 24 24"><path stroke-width="3" d="M6.5 6.5h.01M12 6.5h.01M17.5 6.5h.01M6.5 12h.01M12 12h.01M17.5 12h.01M6.5 17.5h.01M12 17.5h.01M17.5 17.5h.01"/></symbol>
+      <symbol id="i-image" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><circle cx="9" cy="10" r="1.6"/><path d="M20.5 16l-5-5-8 8.5"/></symbol>
+      <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15V4M7.5 8.5L12 4l4.5 4.5M4 15v3.5A1.5 1.5 0 005.5 20h13a1.5 1.5 0 001.5-1.5V15"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5M4 15v3.5A1.5 1.5 0 005.5 20h13a1.5 1.5 0 001.5-1.5V15"/></symbol>
+      <symbol id="i-share" viewBox="0 0 24 24"><path d="M12 3.5v11M8 7.5l4-4 4 4M7.5 10.5H6a1.5 1.5 0 00-1.5 1.5v7A1.5 1.5 0 006 20.5h12a1.5 1.5 0 001.5-1.5v-7a1.5 1.5 0 00-1.5-1.5h-1.5"/></symbol>
+      <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3.5H7A1.5 1.5 0 005.5 5v14A1.5 1.5 0 007 20.5h10a1.5 1.5 0 001.5-1.5V8z"/><path d="M14 3.5V8h4.5"/></symbol>
+      <symbol id="i-more" viewBox="0 0 24 24"><path stroke-width="2.6" d="M6 12h.01M12 12h.01M18 12h.01"/></symbol>
+      <symbol id="i-layer-down" viewBox="0 0 24 24"><path d="M12 4l8 4-8 4-8-4z"/><path d="M4 12.5l8 4 8-4M4 16.5l8 4 8-4"/></symbol>
     </defs>
   </svg>
 
@@ -72,117 +79,145 @@
   </main>
 
   <!-- App -->
-  <div id="app" class="app" data-view="list" hidden>
-    <aside class="sidebar glass">
-      <header class="side-head">
-        <h2>Notas</h2>
-        <button id="net" class="net" type="button" hidden></button>
-        <button id="new-note" class="icon-btn accent" title="Nuevo" aria-label="Nuevo" aria-haspopup="menu" aria-expanded="false"><svg><use href="#i-plus"/></svg></button>
-        <div id="new-menu" class="menu glass" role="menu" hidden>
-          <button role="menuitem" data-kind="note"><svg><use href="#i-type"/></svg><span>Nota<small>Texto y dibujo encima</small></span></button>
-          <button role="menuitem" data-kind="canvas"><svg><use href="#i-canvas"/></svg><span>Lienzo<small>Hoja libre para dibujar</small></span></button>
+  <div id="app" class="app" data-view="hub" hidden>
+
+    <!-- Inicio: todas las notas, lienzos y archivos -->
+    <section id="hub" class="hub view">
+      <header class="hub-head">
+        <div class="hub-title">
+          <h1>Notas</h1>
+          <button id="net" class="net" type="button" hidden></button>
         </div>
-      </header>
-      <label class="search">
-        <svg><use href="#i-search"/></svg>
-        <input id="search" type="search" placeholder="Buscar" autocomplete="off" spellcheck="false">
-      </label>
-      <ul id="note-list" class="note-list"></ul>
-      <footer class="side-foot">
-        <span class="muted who"><span id="whoami"></span> <span class="ver">· v6</span></span>
-        <div class="grow">
+        <div class="hub-tools">
           <div id="theme-picker" class="theme-picker" role="radiogroup" aria-label="Apariencia">
             <button data-theme-mode="auto" role="radio" title="Automático (sistema)" aria-label="Automático"><svg><use href="#i-auto"/></svg></button>
             <button data-theme-mode="light" role="radio" title="Claro" aria-label="Claro"><svg><use href="#i-sun"/></svg></button>
             <button data-theme-mode="dark" role="radio" title="Oscuro" aria-label="Oscuro"><svg><use href="#i-moon"/></svg></button>
           </div>
+          <button id="user-btn" class="avatar" type="button" title="Cuenta" aria-label="Cuenta" aria-haspopup="menu"></button>
         </div>
-        <button id="logout" class="icon-btn" title="Cerrar sesión" aria-label="Cerrar sesión"><svg><use href="#i-logout"/></svg></button>
-      </footer>
-    </aside>
+      </header>
 
-    <section class="editor">
-      <div id="empty" class="empty">
-        <svg><use href="#i-scribble"/></svg>
-        <p>Selecciona o crea una nota o un lienzo</p>
+      <div class="hub-actions">
+        <button class="action" data-new="note" type="button"><span class="action-ic"><svg><use href="#i-type"/></svg></span><span class="action-txt"><b>Nota</b><small>Texto y dibujo</small></span></button>
+        <button class="action" data-new="canvas" type="button"><span class="action-ic"><svg><use href="#i-canvas"/></svg></span><span class="action-txt"><b>Lienzo</b><small>Hoja libre</small></span></button>
+        <button class="action" id="import-btn" type="button"><span class="action-ic"><svg><use href="#i-upload"/></svg></span><span class="action-txt"><b>Importar</b><small>Archivos y copias</small></span></button>
       </div>
 
-      <div id="note-view" class="note-view" hidden>
-        <header class="note-bar">
-          <button id="back" class="icon-btn glass-pill only-compact" aria-label="Notas"><svg><use href="#i-back"/></svg></button>
-          <input id="ctitle" class="ctitle glass-pill" placeholder="Título del lienzo" autocomplete="off" hidden>
-          <span id="status" class="status glass-pill" aria-live="polite"></span>
-          <div class="spacer"></div>
-          <div id="paper-picker" class="paper-picker glass-pill" role="radiogroup" aria-label="Papel" hidden>
-            <button data-paper="blank" title="Hoja en blanco" aria-label="Hoja en blanco"><svg><use href="#i-blank"/></svg></button>
-            <button data-paper="grid" title="Cuadrícula" aria-label="Cuadrícula"><svg><use href="#i-grid"/></svg></button>
-            <button data-paper="lined" title="Rayada" aria-label="Rayada"><svg><use href="#i-lines"/></svg></button>
-            <button data-paper="dots" title="Puntos" aria-label="Puntos"><svg><use href="#i-dots"/></svg></button>
-          </div>
-          <button id="pin" class="icon-btn glass-pill" title="Fijar" aria-label="Fijar" aria-pressed="false"><svg><use href="#i-pin"/></svg></button>
-          <button id="delete" class="icon-btn glass-pill" title="Eliminar" aria-label="Eliminar"><svg><use href="#i-trash"/></svg></button>
-        </header>
+      <div class="hub-bar">
+        <label class="search">
+          <svg><use href="#i-search"/></svg>
+          <input id="search" type="search" placeholder="Buscar" autocomplete="off" spellcheck="false">
+        </label>
+        <div id="filters" class="chips" role="tablist" aria-label="Filtrar">
+          <button data-filter="all" class="on" role="tab">Todo<span class="count"></span></button>
+          <button data-filter="note" role="tab">Notas<span class="count"></span></button>
+          <button data-filter="canvas" role="tab">Lienzos<span class="count"></span></button>
+          <button data-filter="file" role="tab">Archivos<span class="count"></span></button>
+        </div>
+      </div>
 
-        <div id="scroller" class="scroller">
-          <div class="sheet-wrap">
-            <div id="sheet" class="sheet" data-paper="blank">
-              <input id="title" class="title" placeholder="Título" autocomplete="off" enterkeyhint="next">
-              <textarea id="body" class="body" placeholder="Escribe o dibuja con el Apple Pencil…" spellcheck="true"></textarea>
-              <canvas id="canvas" class="canvas"></canvas>
-              <canvas id="live" class="canvas live"></canvas>
-              <div id="sel-ui" class="sel-ui glass-pill" hidden>
-                <button id="sel-copy" title="Duplicar" aria-label="Duplicar"><svg><use href="#i-copy"/></svg></button>
-                <button id="sel-del" title="Eliminar" aria-label="Eliminar"><svg><use href="#i-trash"/></svg></button>
-              </div>
+      <div id="hub-body" class="hub-body"></div>
+      <div id="drop-hint" class="drop-hint" hidden><div class="glass"><svg><use href="#i-upload"/></svg><span>Suelta para importar</span></div></div>
+    </section>
+
+    <!-- Editor de nota / lienzo -->
+    <section id="note-view" class="note-view view" hidden>
+      <header class="note-bar">
+        <button id="back" class="icon-btn glass-pill" title="Inicio" aria-label="Volver al inicio"><svg><use href="#i-back"/></svg></button>
+        <input id="ctitle" class="ctitle glass-pill" placeholder="Título del lienzo" autocomplete="off" hidden>
+        <span id="status" class="status glass-pill" aria-live="polite"></span>
+        <div class="spacer"></div>
+        <div id="paper-picker" class="paper-picker glass-pill" role="radiogroup" aria-label="Papel" hidden>
+          <button data-paper="blank" title="Hoja en blanco" aria-label="Hoja en blanco"><svg><use href="#i-blank"/></svg></button>
+          <button data-paper="grid" title="Cuadrícula" aria-label="Cuadrícula"><svg><use href="#i-grid"/></svg></button>
+          <button data-paper="lined" title="Rayada" aria-label="Rayada"><svg><use href="#i-lines"/></svg></button>
+          <button data-paper="dots" title="Puntos" aria-label="Puntos"><svg><use href="#i-dots"/></svg></button>
+        </div>
+        <button id="export-btn" class="icon-btn glass-pill" title="Exportar" aria-label="Exportar" aria-haspopup="menu"><svg><use href="#i-share"/></svg></button>
+        <button id="pin" class="icon-btn glass-pill" title="Fijar" aria-label="Fijar" aria-pressed="false"><svg><use href="#i-pin"/></svg></button>
+        <button id="delete" class="icon-btn glass-pill" title="Eliminar" aria-label="Eliminar"><svg><use href="#i-trash"/></svg></button>
+      </header>
+
+      <div id="scroller" class="scroller">
+        <div class="sheet-wrap">
+          <div id="sheet" class="sheet" data-paper="blank">
+            <input id="title" class="title" placeholder="Título" autocomplete="off" enterkeyhint="next">
+            <textarea id="body" class="body" placeholder="Escribe o dibuja con el Apple Pencil…" spellcheck="true"></textarea>
+            <canvas id="canvas" class="canvas"></canvas>
+            <canvas id="live" class="canvas live"></canvas>
+            <div id="sel-ui" class="sel-ui glass-pill" hidden>
+              <button id="sel-back" title="Enviar al fondo" aria-label="Enviar al fondo"><svg><use href="#i-layer-down"/></svg></button>
+              <button id="sel-copy" title="Duplicar" aria-label="Duplicar"><svg><use href="#i-copy"/></svg></button>
+              <button id="sel-del" title="Eliminar" aria-label="Eliminar"><svg><use href="#i-trash"/></svg></button>
             </div>
           </div>
         </div>
+      </div>
 
-        <!-- Paneles de herramientas -->
-        <div id="pop" class="pop glass" hidden>
-          <div class="pop-sec" data-pop="pen">
-            <div id="pen-list" class="pen-list"></div>
-            <label class="slider"><span>Grosor</span><input id="size" type="range" min="0.4" max="4" step="0.1" value="1"></label>
-          </div>
-          <div class="pop-sec" data-pop="shape">
-            <div id="shape-list" class="shape-list"></div>
-            <label class="toggle"><input id="shape-fill" type="checkbox"><span>Relleno</span></label>
-            <label class="slider"><span>Grosor</span><input id="size2" type="range" min="0.4" max="4" step="0.1" value="1"></label>
-          </div>
-          <div class="pop-sec" data-pop="color">
-            <div id="palette" class="palette"></div>
-            <label class="custom-color"><span>Personalizado</span><input id="custom-color" type="color" value="#0a84ff"></label>
-          </div>
-          <div class="pop-sec" data-pop="sticker">
-            <div id="sticker-list" class="sticker-list"></div>
-          </div>
+      <!-- Paneles de herramientas -->
+      <div id="pop" class="pop glass" hidden>
+        <div class="pop-sec" data-pop="pen">
+          <div id="pen-list" class="pen-list"></div>
+          <label class="slider"><span>Grosor</span><input id="size" type="range" min="0.4" max="4" step="0.1" value="1"></label>
         </div>
+        <div class="pop-sec" data-pop="shape">
+          <div id="shape-list" class="shape-list"></div>
+          <label class="toggle"><input id="shape-fill" type="checkbox"><span>Relleno</span></label>
+          <label class="slider"><span>Grosor</span><input id="size2" type="range" min="0.4" max="4" step="0.1" value="1"></label>
+        </div>
+        <div class="pop-sec" data-pop="color">
+          <div id="palette" class="palette"></div>
+          <label class="custom-color"><span>Personalizado</span><input id="custom-color" type="color" value="#0a84ff"></label>
+        </div>
+        <div class="pop-sec" data-pop="sticker">
+          <div id="sticker-list" class="sticker-list"></div>
+        </div>
+      </div>
 
-        <div class="toolbar glass" role="toolbar" aria-label="Herramientas">
-          <div class="group">
-            <button class="tool note-only" data-tool="text" title="Texto" aria-label="Texto"><svg><use href="#i-type"/></svg></button>
-            <button class="tool" data-tool="pen" title="Lápiz" aria-label="Lápiz"><svg><use href="#i-pen"/></svg></button>
-            <button class="tool" data-tool="eraser" title="Borrador" aria-label="Borrador"><svg><use href="#i-eraser"/></svg></button>
-            <button class="tool" data-tool="shape" title="Formas" aria-label="Formas"><svg><use href="#i-shapes"/></svg></button>
-            <button class="tool" data-tool="sticker" title="Stickers" aria-label="Stickers"><svg><use href="#i-smile"/></svg></button>
-            <button class="tool" data-tool="select" title="Seleccionar y mover" aria-label="Seleccionar"><svg><use href="#i-cursor"/></svg></button>
-          </div>
-          <div class="group draw-only">
-            <button id="color-btn" class="color-btn" title="Color" aria-label="Color"></button>
-          </div>
-          <div class="group">
-            <button id="undo" class="tool draw-only" title="Deshacer" aria-label="Deshacer"><svg><use href="#i-undo"/></svg></button>
-            <button id="redo" class="tool draw-only" title="Rehacer" aria-label="Rehacer"><svg><use href="#i-redo"/></svg></button>
-            <button id="finger" class="tool draw-only" title="Dibujar también con el dedo" aria-label="Dibujar con el dedo" aria-pressed="false"><svg><use href="#i-touch"/></svg></button>
-            <button id="more-page" class="tool draw-only" title="Agregar espacio" aria-label="Agregar espacio"><svg><use href="#i-page"/></svg></button>
-          </div>
+      <div class="toolbar glass" role="toolbar" aria-label="Herramientas">
+        <div class="group">
+          <button class="tool note-only" data-tool="text" title="Texto" aria-label="Texto"><svg><use href="#i-type"/></svg></button>
+          <button class="tool" data-tool="pen" title="Lápiz" aria-label="Lápiz"><svg><use href="#i-pen"/></svg></button>
+          <button class="tool" data-tool="eraser" title="Borrador" aria-label="Borrador"><svg><use href="#i-eraser"/></svg></button>
+          <button class="tool" data-tool="shape" title="Formas" aria-label="Formas"><svg><use href="#i-shapes"/></svg></button>
+          <button class="tool" data-tool="sticker" title="Stickers" aria-label="Stickers"><svg><use href="#i-smile"/></svg></button>
+          <button class="tool" data-tool="select" title="Seleccionar y mover" aria-label="Seleccionar"><svg><use href="#i-cursor"/></svg></button>
+          <button id="insert-image" class="tool" title="Insertar imagen" aria-label="Insertar imagen"><svg><use href="#i-image"/></svg></button>
+        </div>
+        <div class="group draw-only">
+          <button id="color-btn" class="color-btn" title="Color" aria-label="Color"></button>
+        </div>
+        <div class="group">
+          <button id="undo" class="tool draw-only" title="Deshacer" aria-label="Deshacer"><svg><use href="#i-undo"/></svg></button>
+          <button id="redo" class="tool draw-only" title="Rehacer" aria-label="Rehacer"><svg><use href="#i-redo"/></svg></button>
+          <button id="finger" class="tool draw-only" title="Dibujar también con el dedo" aria-label="Dibujar con el dedo" aria-pressed="false"><svg><use href="#i-touch"/></svg></button>
+          <button id="more-page" class="tool draw-only" title="Agregar espacio" aria-label="Agregar espacio"><svg><use href="#i-page"/></svg></button>
         </div>
       </div>
     </section>
+
+    <!-- Visor de archivos -->
+    <section id="file-view" class="file-view view" hidden>
+      <header class="note-bar">
+        <button id="file-back" class="icon-btn glass-pill" title="Inicio" aria-label="Volver al inicio"><svg><use href="#i-back"/></svg></button>
+        <span id="file-name" class="file-name glass-pill"></span>
+        <div class="spacer"></div>
+        <button id="file-annotate" class="pill-btn glass-pill" hidden><svg><use href="#i-pen"/></svg><span>Anotar</span></button>
+        <button id="file-save" class="icon-btn glass-pill" title="Descargar / compartir" aria-label="Descargar"><svg><use href="#i-download"/></svg></button>
+        <button id="file-delete" class="icon-btn glass-pill" title="Eliminar" aria-label="Eliminar"><svg><use href="#i-trash"/></svg></button>
+      </header>
+      <div id="file-body" class="file-body"></div>
+    </section>
   </div>
+
+  <!-- Menú flotante (tarjetas, exportar, cuenta) -->
+  <div id="float-menu" class="menu glass float-menu" role="menu" hidden></div>
+  <input id="import-input" type="file" multiple hidden>
+  <input id="image-input" type="file" accept="image/*" hidden>
 
   <div id="toast" class="toast glass" role="status" hidden></div>
 
-  <script src="app.js" type="module"></script>
+  <script src="app.js?v=__V__" type="module"></script>
 </body>
 </html>
