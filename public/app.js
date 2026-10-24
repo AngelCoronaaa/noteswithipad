@@ -1,9 +1,13 @@
+import { openStore, newLocalNote, fromServer } from './store.js';
+import { createSync } from './sync.js';
+
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 // ---------- API ----------
 
-async function api(method, url, body) {
+// quiet: no redirigir a la pantalla de acceso si la sesión caducó (lo usa la sincronización en segundo plano)
+async function api(method, url, body, { quiet = false } = {}) {
   const res = await fetch(url, {
     method,
     headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
@@ -11,12 +15,21 @@ async function api(method, url, body) {
     credentials: 'same-origin',
   });
   if (res.status === 401 && !url.startsWith('/api/auth')) {
-    showAuth();
+    if (!quiet) showAuth();
     throw Object.assign(new Error('Sesión expirada'), { status: 401 });
   }
   const data = res.status === 204 ? null : await res.json().catch(() => null);
-  if (!res.ok) throw Object.assign(new Error(data?.error || 'Error'), { status: res.status });
+  if (!res.ok) throw Object.assign(new Error(data?.error || 'Error'), { status: res.status, data });
   return data;
+}
+
+// UUID v4 (crypto.randomUUID solo existe en HTTPS; getRandomValues funciona siempre)
+function uuid() {
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
 // ---------- Catálogos ----------
@@ -60,6 +73,8 @@ const EMOJIS = ['⭐', '❤️', '🔥', '✅', '❗', '❓', '💡', '📌', '�
 const LABELS = [['IDEA', '#ff9f0a'], ['HECHO', '#30d158'], ['URGENTE', '#ff453a'], ['TO-DO', '#0a84ff']];
 
 const HANDLE_ROOM = 0.025; // margen derecho para el asa de escala (fracción del ancho)
+const MAX_SHEET_H = 10;       // alto máximo de la hoja (en anchos)
+const MAX_CANVAS_PX = 12e6;   // Safari/iPad deja de dibujar por encima de ~16,7 M px
 const REF_WIDTH = 800; // los grosores se guardan como px sobre una hoja de 800 px de ancho
 const DEFAULT_SHEET_H = { note: 1.3, canvas: 1.7 };
 
@@ -81,6 +96,7 @@ const state = {
   sticker: '⭐',
   fingerDraws: false,
   query: '',
+  pendingIds: new Set(), // notas con cambios sin sincronizar
 };
 const dirty = new Set();
 let saveTimer = null;
@@ -107,7 +123,7 @@ const els = {
   title: $('#title'), ctitle: $('#ctitle'), body: $('#body'), canvas: $('#canvas'), live: $('#live'), status: $('#status'),
   pin: $('#pin'), undo: $('#undo'), redo: $('#redo'), finger: $('#finger'),
   pop: $('#pop'), selUi: $('#sel-ui'), paperPicker: $('#paper-picker'), colorBtn: $('#color-btn'),
-  newMenu: $('#new-menu'), newBtn: $('#new-note'),
+  newMenu: $('#new-menu'), newBtn: $('#new-note'), net: $('#net'), toast: $('#toast'),
 };
 const ctx = els.canvas.getContext('2d');
 const lctx = els.live.getContext('2d');
@@ -156,19 +172,112 @@ els.authForm.addEventListener('submit', async (e) => {
   }
 });
 
+let store = null;       // almacén local del usuario actual
+let sync = null;        // motor de sincronización
+let netState = { s: 'idle', pending: 0 };
+let lastEditAt = -Infinity; // momento de la última edición (para no pisar lo que se está escribiendo)
+
 $('#logout').addEventListener('click', async () => {
   await flush().catch(() => {});
-  await api('POST', '/api/auth/logout', {}).catch(() => {});
+  if (!navigator.onLine) {
+    alert('Necesitas conexión para cerrar sesión: así no se pierden cambios sin sincronizar.');
+    return;
+  }
+  await sync?.flushNow().catch(() => {});
+  const left = sync ? await sync.pendingCount() : 0;
+  if (left) {
+    // Sin poder sincronizar, cerrar sesión borraría cambios que solo existen en este dispositivo.
+    if (['offline', 'error'].includes(sync.getState())) {
+      alert(`Hay ${left} cambio(s) sin sincronizar y ahora no hay conexión con el servidor. Inténtalo de nuevo cuando vuelva la conexión para no perderlos.`);
+      return;
+    }
+    if (!confirm(`Hay ${left} cambio(s) que no se pudieron sincronizar. Si cierras sesión se perderán. ¿Cerrar sesión de todos modos?`)) return;
+  }
+  try {
+    await api('POST', '/api/auth/logout', {});
+  } catch (err) {
+    if (!err.status) {
+      alert('No se pudo contactar con el servidor. Inténtalo de nuevo.');
+      return;
+    }
+  }
+  try { localStorage.removeItem('lastUser'); } catch {}
+  await teardown({ wipe: true }); // se borran las copias locales de este dispositivo
   showAuth();
 });
 
+async function teardown({ wipe = false } = {}) {
+  sync?.stop();
+  sync = null;
+  if (store && wipe) await store.destroy();
+  store = null;
+}
+
 async function startApp(user) {
+  try { localStorage.setItem('lastUser', JSON.stringify(user)); } catch {}
+  await teardown();
+  store = await openStore(user.id);
+  sync = createSync({ store, api, uuid, hooks: syncHooks });
   els.auth.hidden = true;
   els.app.hidden = false;
   els.whoami.textContent = `@${user.username}`;
   closeNote();
   await loadNotes();
+  sync.schedule({ pull: true, ms: 0 });
 }
+
+const syncHooks = {
+  onState(s, pending) {
+    netState = { s, pending };
+    renderNet();
+    updateStatus();
+  },
+  onListChanged: () => loadNotes().catch(() => {}),
+  onNoteReplaced(id) {
+    if (state.current?.id === id) refreshOpenNote(id);
+  },
+  onNoteRemoved(id) {
+    if (state.current?.id === id) closeNote();
+  },
+  onNotice: (msg) => showToast(msg),
+  isEditing: (id) => state.current?.id === id && (dirty.size > 0 || active !== null || performance.now() - lastEditAt < 4000),
+};
+
+// Indicador de conexión / sincronización en la cabecera de la lista
+function renderNet() {
+  const { s, pending } = netState;
+  const n = pending ? ` · ${pending} pendiente${pending === 1 ? '' : 's'}` : '';
+  let text = '';
+  if (s === 'offline') text = `Sin conexión${n}`;
+  else if (s === 'error') text = `Error del servidor${n}`;
+  else if (s === 'auth') text = 'Sesión caducada · Entrar';
+  else if (s === 'syncing' && pending) text = `Sincronizando…`;
+  els.net.hidden = !text;
+  els.net.textContent = text;
+  els.net.dataset.state = s;
+}
+els.net.addEventListener('click', () => {
+  if (netState.s === 'auth') showAuth();
+  else sync?.schedule({ pull: true, ms: 0 });
+});
+
+let toastTimer;
+function showToast(msg) {
+  els.toast.textContent = msg;
+  els.toast.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (els.toast.hidden = true), 8000);
+}
+els.toast.addEventListener('click', () => (els.toast.hidden = true));
+
+addEventListener('online', () => sync?.schedule({ pull: true, ms: 0 }));
+addEventListener('offline', () => syncHooks.onState('offline', netState.pending));
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') sync?.schedule({ pull: true, ms: 0 });
+});
+setInterval(() => {
+  if (document.visibilityState === 'visible' && navigator.onLine) sync?.schedule({ pull: true, ms: 0 });
+}, 45000);
 
 // ---------- Lista ----------
 
@@ -192,7 +301,7 @@ function svgIcon(name, cls) {
 
 const noteTitle = (n) => n.title.trim() || (n.kind === 'canvas' ? 'Lienzo sin título' : 'Sin título');
 const noteMeta = (n) =>
-  `${formatDate(n.updated_at)}  ${n.preview.replace(/\s+/g, ' ').trim() || (n.kind === 'canvas' ? 'Lienzo' : 'Sin texto adicional')}`;
+  `${formatDate(n.sortAt)}  ${n.preview.replace(/\s+/g, ' ').trim() || (n.kind === 'canvas' ? 'Lienzo' : 'Sin texto adicional')}`;
 
 function renderList() {
   els.list.replaceChildren();
@@ -218,6 +327,12 @@ function renderList() {
     if (n.kind === 'canvas') row.append(svgIcon('canvas'));
     else if (n.has_drawing) row.append(svgIcon('pen'));
     if (n.pinned) row.append(svgIcon('pin', 'pin-ic'));
+    if (n.pending) {
+      const dot = document.createElement('i');
+      dot.className = 'pend' + (n.syncError ? ' err' : '');
+      dot.title = n.syncError ? `No se pudo sincronizar: ${n.syncError}` : 'Pendiente de sincronizar';
+      row.append(dot);
+    }
 
     const meta = document.createElement('div');
     meta.className = 'meta';
@@ -230,12 +345,18 @@ function renderList() {
   }
 }
 
+// La lista sale del almacén local (funciona sin conexión); la sincronización lo mantiene al día.
+let loadSeq = 0;
 async function loadNotes() {
-  const q = state.query;
-  const notes = await api('GET', `/api/notes${q ? `?q=${encodeURIComponent(q)}` : ''}`);
-  if (q !== state.query) return;
-  state.notes = notes;
+  if (!store) return;
+  const seq = ++loadSeq;
+  const all = await store.items();
+  if (seq !== loadSeq) return;
+  state.pendingIds = new Set(all.filter((i) => i.pending).map((i) => i.id));
+  const q = state.query.toLowerCase();
+  state.notes = (q ? all.filter((i) => i.search.includes(q)) : all).sort((a, b) => b.pinned - a.pinned || b.sortAt - a.sortAt);
   renderList();
+  updateStatus();
 }
 
 let searchTimer;
@@ -253,17 +374,19 @@ function toggleNewMenu(open = els.newMenu.hidden) {
   els.newBtn.setAttribute('aria-expanded', String(open));
 }
 els.newBtn.addEventListener('click', () => toggleNewMenu());
+async function createNote(kind) {
+  await flush().catch(() => {});
+  const note = newLocalNote(uuid(), kind);
+  await store.put(note);
+  await loadNotes();
+  await openNote(note.id, { focusTitle: true });
+  if (kind === 'canvas') openPop('pen'); // muestra lápices y colores al crear un lienzo
+  sync.schedule();
+}
 $$('button', els.newMenu).forEach((b) =>
-  b.addEventListener('click', async () => {
+  b.addEventListener('click', () => {
     toggleNewMenu(false);
-    await flush().catch(() => {});
-    const note = await api('POST', '/api/notes', { kind: b.dataset.kind });
-    if (note.kind === undefined && b.dataset.kind === 'canvas') {
-      alert('El servidor está desactualizado y no soporta lienzos. Deténlo y vuelve a iniciarlo con npm start.');
-    }
-    state.notes.unshift(note);
-    await openNote(note.id, { focusTitle: true });
-    if (b.dataset.kind === 'canvas') openPop('pen'); // muestra lápices y colores al crear un lienzo
+    createNote(b.dataset.kind).catch(() => {});
   })
 );
 document.addEventListener('pointerdown', (e) => {
@@ -273,12 +396,12 @@ document.addEventListener('pointerdown', (e) => {
 
 // ---------- Editor ----------
 
-async function openNote(id, { focusTitle = false } = {}) {
+// keepView: recarga el contenido (p. ej. llegó una versión nueva de otro dispositivo) sin mover la hoja ni la herramienta.
+async function openNote(id, { focusTitle = false, keepView = false } = {}) {
   await flush().catch(() => {});
-  const note = await api('GET', `/api/notes/${id}`);
-  const staleServer = note.kind === undefined;
-  note.kind ??= 'note';
-  note.paper ??= 'blank';
+  const note = await store.get(id);
+  if (!note) return;
+  const scrollTop = els.scroller.scrollTop;
   state.current = { id: note.id, title: note.title, body: note.body, pinned: note.pinned, kind: note.kind, paper: note.paper };
   state.items = Array.isArray(note.drawing?.strokes) ? note.drawing.strokes : [];
   state.undo = [];
@@ -286,7 +409,7 @@ async function openNote(id, { focusTitle = false } = {}) {
   state.sel = null;
   liveItem = null;
   dirty.clear();
-  closePop();
+  if (!keepView) closePop();
 
   const canvasKind = note.kind === 'canvas';
   els.noteView.dataset.kind = note.kind;
@@ -298,20 +421,27 @@ async function openNote(id, { focusTitle = false } = {}) {
   syncPaperPicker();
   els.sheet.style.setProperty('--sheet-h', String(note.drawing?.h ?? DEFAULT_SHEET_H[note.kind]));
   els.pin.setAttribute('aria-pressed', String(note.pinned));
-  if (staleServer) setStatus('Servidor desactualizado: reinícialo con npm start', true);
-  else setStatus('');
+  updateStatus();
 
   els.empty.hidden = true;
   els.noteView.hidden = false;
   els.app.dataset.view = 'note';
-  els.scroller.scrollTop = 0;
+  els.scroller.scrollTop = keepView ? scrollTop : 0;
   autoGrow();
-  if (canvasKind) setTool(state.tool === 'text' ? 'pen' : state.tool);
-  else setTool(state.items.length && !note.body ? 'pen' : 'text');
+  if (!keepView) {
+    if (canvasKind) setTool(state.tool === 'text' ? 'pen' : state.tool);
+    else setTool(state.items.length && !note.body ? 'pen' : 'text');
+  }
   syncCanvasSize();
   updateHistoryButtons();
   renderList();
   if (focusTitle && !canvasKind && state.tool === 'text') els.title.focus();
+}
+
+// Llegó una versión nueva de la nota abierta: se recarga solo si no se está editando.
+function refreshOpenNote(id) {
+  if (state.current?.id !== id || syncHooks.isEditing(id)) return;
+  openNote(id, { keepView: true }).catch(() => {});
 }
 
 function closeNote() {
@@ -373,9 +503,12 @@ $('#delete').addEventListener('click', async () => {
   const id = state.current.id;
   clearTimeout(saveTimer);
   dirty.clear();
-  await api('DELETE', `/api/notes/${id}`).catch(() => {});
-  state.notes = state.notes.filter((n) => n.id !== id);
+  const note = await store.get(id);
+  await store.remove(id);
+  if (note && !note.isNew) await store.markDeleted(id); // el borrado se envía al servidor al sincronizar
   closeNote();
+  await loadNotes();
+  sync.schedule();
 });
 
 // Papel del lienzo
@@ -392,17 +525,32 @@ $$('button', els.paperPicker).forEach((b) =>
 );
 
 // ---------- Guardado ----------
+// Cada cambio se guarda enseguida en el dispositivo (IndexedDB) y la sincronización lo envía al servidor
+// cuando hay conexión. Así se puede editar sin conexión.
 
 function setStatus(text, isError = false) {
   els.status.textContent = text;
   els.status.classList.toggle('err', isError);
 }
 
+// Estado de la nota abierta: guardada, pendiente (sin conexión) o sincronizando.
+function updateStatus() {
+  if (!state.current) return;
+  if (dirty.size) return setStatus('Guardando…');
+  const item = state.notes.find((n) => n.id === state.current.id);
+  if (item?.syncError) return setStatus('No se pudo sincronizar', true);
+  if (!state.pendingIds.has(state.current.id)) return setStatus(store && !store.persistent ? 'Guardado' : 'Guardado');
+  if (netState.s === 'offline' || netState.s === 'error') return setStatus('Guardado en este dispositivo · se sincronizará');
+  if (netState.s === 'auth') return setStatus('Guardado en este dispositivo · inicia sesión para sincronizar');
+  setStatus('Guardado · sincronizando…');
+}
+
 function markDirty(field) {
   dirty.add(field);
+  lastEditAt = performance.now();
   setStatus('Guardando…');
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => flush().catch(() => {}), 700);
+  saveTimer = setTimeout(() => flush().catch(() => {}), 600);
 }
 
 function drawingPayload() {
@@ -415,38 +563,29 @@ function flush() {
   clearTimeout(saveTimer);
   // Serializa los guardados para que no se pisen entre sí.
   const run = saving.then(async () => {
-    if (!state.current || !dirty.size) return;
+    if (!state.current || !dirty.size || !store) return;
     const id = state.current.id;
     const fields = [...dirty];
     dirty.clear();
-    const patch = {};
-    for (const f of fields) {
-      patch[f] = f === 'drawing' ? drawingPayload() : state.current[f];
-    }
     try {
-      const saved = await api('PUT', `/api/notes/${id}`, patch);
-      const i = state.notes.findIndex((n) => n.id === id);
-      if (i >= 0) state.notes[i] = saved;
-      if (state.current?.id === id) {
-        setStatus('Guardado');
-        if (!dirty.size) reorderList();
-      }
+      const note = await store.get(id);
+      if (!note) return; // se eliminó
+      for (const f of fields) note[f] = f === 'drawing' ? drawingPayload() : state.current[f];
+      note.dirty = [...new Set([...note.dirty, ...fields])];
+      note.rev += 1;
+      note.localAt = Date.now();
+      note.syncError = null;
+      await store.put(note);
     } catch (err) {
-      if (err.status === 401) return;
       fields.forEach((f) => dirty.add(f));
-      setStatus('Sin conexión · reintentando', true);
-      saveTimer = setTimeout(() => flush().catch(() => {}), 4000);
+      setStatus(err?.name === 'QuotaExceededError' ? 'No hay espacio para guardar en este dispositivo' : 'No se pudo guardar en el dispositivo', true);
       throw err;
     }
+    await loadNotes();
+    sync.schedule();
   });
   saving = run.catch(() => {}); // un fallo no debe bloquear los guardados siguientes
   return run;
-}
-
-function reorderList() {
-  if (state.query) return renderList();
-  state.notes.sort((a, b) => b.pinned - a.pinned || new Date(b.updated_at) - new Date(a.updated_at));
-  renderList();
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -631,6 +770,7 @@ $('#more-page').addEventListener('click', extendSheet);
 
 function extendSheet() {
   const h = els.sheet.offsetHeight / els.sheet.offsetWidth;
+  if (h >= MAX_SHEET_H) return;
   els.sheet.style.setProperty('--sheet-h', String(Math.round((h + 0.5) * 100) / 100));
   markDirty('drawing');
 }
@@ -691,7 +831,14 @@ function shapePolys(s) {
   }
 }
 
+const boundsCache = new WeakMap(); // los objetos son inmutables: se pueden cachear
 function bounds(it) {
+  let b = boundsCache.get(it);
+  if (!b) boundsCache.set(it, (b = computeBounds(it)));
+  return b;
+}
+
+function computeBounds(it) {
   if (it.t === 'sticker') {
     const { w, h } = stickerSize(it);
     return { x0: it.x - w / 2, y0: it.y - h / 2, x1: it.x + w / 2, y1: it.y + h / 2 };
@@ -732,6 +879,7 @@ function nearPolyline(pts, closed, x, y, r) {
 
 // interior: también cuenta el interior de formas rellenas y stickers (para seleccionar)
 function hitItem(it, x, y, r, interior) {
+  if (!inBounds(bounds(it), x, y, r + 0.02)) return false;
   if (it.t === 'sticker') return inBounds(bounds(it), x, y, r / 2);
   if (it.t === 'shape') {
     const rr = r + it.w / REF_WIDTH / 2;
@@ -739,6 +887,29 @@ function hitItem(it, x, y, r, interior) {
     return interior && it.f && inBounds(bounds(it), x, y);
   }
   return nearPolyline(it.p, false, x, y, r + strokeW(it, 1) / 2);
+}
+
+// Ramer–Douglas–Peucker; también conserva puntos donde cambia la presión.
+function simplify(pts, eps) {
+  if (pts.length < 3) return pts;
+  const keep = new Uint8Array(pts.length);
+  keep[0] = keep[pts.length - 1] = 1;
+  const stack = [[0, pts.length - 1]];
+  while (stack.length) {
+    const [a, b] = stack.pop();
+    let worst = 0, idx = -1;
+    for (let i = a + 1; i < b; i++) {
+      const spatial = distToSegment(pts[i][0], pts[i][1], pts[a], pts[b]) / eps;
+      const pr = pts[a][2] + ((pts[b][2] - pts[a][2]) * (i - a)) / (b - a);
+      const err = Math.max(spatial, Math.abs(pts[i][2] - pr) / 0.1);
+      if (err > worst) { worst = err; idx = i; }
+    }
+    if (worst > 1) {
+      keep[idx] = 1;
+      stack.push([a, idx], [idx, b]);
+    }
+  }
+  return pts.filter((_, i) => keep[i]);
 }
 
 function mapItem(it, fx, fy, k) {
@@ -753,12 +924,13 @@ const resolveColor = (c) => (c === 'ink' ? getComputedStyle(document.documentEle
 const setNormalized = (c) => c.setTransform(c.canvas.width, 0, 0, c.canvas.width, 0, 0);
 
 function syncCanvasSize() {
-  const dpr = window.devicePixelRatio || 1;
   const rect = els.sheet.getBoundingClientRect();
+  // Si la hoja crece mucho, baja la resolución en lugar de pasarse del límite de memoria del navegador.
+  const dpr = Math.min(window.devicePixelRatio || 1, Math.sqrt(MAX_CANVAS_PX / Math.max(1, rect.width * rect.height)));
   const w = Math.max(1, Math.round(rect.width * dpr));
   const h = Math.max(1, Math.round(rect.height * dpr));
   if (els.canvas.width !== w || els.canvas.height !== h) {
-    for (const c of [els.canvas, els.live, layer]) {
+    for (const c of [els.canvas, els.live]) {
       c.width = w;
       c.height = h;
     }
@@ -767,7 +939,7 @@ function syncCanvasSize() {
   renderLive();
 }
 new ResizeObserver(syncCanvasSize).observe(els.sheet);
-matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { redraw(); renderLive(); });
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme(themePref(), { save: false }));
 
 function strokeSegment(c, it, a, b) {
   c.lineWidth = strokeW(it, (a[2] + b[2]) / 2);
@@ -865,46 +1037,54 @@ function drawAlphaStroke(it) {
   const W = els.canvas.width;
   const b = bounds(it);
   const x0 = Math.max(0, Math.floor(b.x0 * W) - 2), y0 = Math.max(0, Math.floor(b.y0 * W) - 2);
-  const x1 = Math.min(layer.width, Math.ceil(b.x1 * W) + 2), y1 = Math.min(layer.height, Math.ceil(b.y1 * W) + 2);
-  if (x1 <= x0 || y1 <= y0) return;
+  const x1 = Math.min(els.canvas.width, Math.ceil(b.x1 * W) + 2), y1 = Math.min(els.canvas.height, Math.ceil(b.y1 * W) + 2);
+  const w = x1 - x0, h = y1 - y0;
+  if (w <= 0 || h <= 0) return;
+  if (layer.width < w) layer.width = w;
+  if (layer.height < h) layer.height = h;
   layerCtx.setTransform(1, 0, 0, 1, 0, 0);
-  layerCtx.clearRect(x0, y0, x1 - x0, y1 - y0);
-  setNormalized(layerCtx);
+  layerCtx.clearRect(0, 0, layer.width, layer.height);
+  layerCtx.setTransform(W, 0, 0, W, -x0, -y0);
   drawStroke(layerCtx, it);
   if (pen.grain) {
-    layerCtx.setTransform(1, 0, 0, 1, 0, 0);
+    layerCtx.setTransform(1, 0, 0, 1, -x0, -y0); // el patrón queda anclado al origen de la hoja
     layerCtx.globalCompositeOperation = 'destination-out';
     layerCtx.fillStyle = getGrain().erasePattern;
-    layerCtx.fillRect(x0, y0, x1 - x0, y1 - y0);
+    layerCtx.fillRect(x0, y0, w, h);
     layerCtx.globalCompositeOperation = 'source-over';
   }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.globalAlpha = pen.alpha;
-  ctx.drawImage(layer, x0, y0, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
+  ctx.drawImage(layer, 0, 0, w, h, x0, y0, w, h);
   ctx.globalAlpha = 1;
+}
+
+// Dibuja solo un objeto recién creado (sin repintar toda la hoja).
+function drawCommitted(it) {
+  if (!it.t && penOf(it).alpha < 1) {
+    drawAlphaStroke(it);
+  } else {
+    setNormalized(ctx);
+    drawItem(ctx, it);
+  }
 }
 
 function redraw() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
-  for (const it of state.items) {
-    if (!it.t && penOf(it).alpha < 1) {
-      drawAlphaStroke(it);
-    } else {
-      setNormalized(ctx);
-      drawItem(ctx, it);
-    }
-  }
+  for (const it of state.items) drawCommitted(it);
 }
 
 // Capa en vivo: trazo/forma en curso o recuadro de selección.
 let liveItem = null;
 
+const pxScale = () => els.canvas.width / (els.sheet.offsetWidth || 1);
+
 function setLiveStyle(pen) {
   els.live.style.opacity = pen ? String(pen.alpha) : '1';
   const mask = pen?.grain ? getGrain().maskUrl : '';
   els.live.style.webkitMaskImage = els.live.style.maskImage = mask;
-  const size = mask ? `${GRAIN / (window.devicePixelRatio || 1)}px` : '';
+  const size = mask ? `${GRAIN / pxScale()}px` : '';
   els.live.style.webkitMaskSize = els.live.style.maskSize = size;
 }
 
@@ -929,7 +1109,7 @@ function drawSelection() {
     return;
   }
   const W = els.live.width;
-  const dpr = window.devicePixelRatio || 1;
+  const dpr = pxScale();
   const b = bounds(it);
   const pad = 6 * dpr;
   const x = b.x0 * W - pad, y = b.y0 * W - pad, w = (b.x1 - b.x0) * W + pad * 2, h = (b.y1 - b.y0) * W + pad * 2;
@@ -1032,7 +1212,8 @@ document.addEventListener('keydown', (e) => {
 
 // ---------- Entrada con Pencil / ratón / dedo ----------
 
-let active = null; // acción en curso: { id, mode, ... }
+let active = null; // acción en curso: { id, mode, t, ... }
+let lastPenAt = 0; // última vez que se vio el Pencil (también al pasar sobre la pantalla)
 let inertia = 0;
 
 const stopInertia = () => cancelAnimationFrame(inertia);
@@ -1061,13 +1242,28 @@ function itemAt(x, y, rect) {
 function onCanvasDown(e) {
   if (state.tool === 'text') return;
   if (e.pointerType === 'mouse' && e.button !== 0) return;
+  const now = performance.now();
+  if (e.pointerType === 'pen') lastPenAt = now;
+  // Rechazo de palma: mientras el Pencil esté cerca, los toques con la mano se ignoran.
+  if (e.pointerType === 'touch' && now - lastPenAt < 1500) {
+    e.preventDefault();
+    return;
+  }
   if (active) {
-    // El Pencil tiene prioridad sobre una palma o un dedo que ya estaba apoyado.
-    if (active.mode === 'pan' && e.pointerType === 'pen') active = null;
-    else return;
+    if (e.pointerType === 'pen') {
+      // El Pencil siempre tiene prioridad: suelta lo que estuviera en curso (una palma, o un trazo cuyo "levantar" se perdió).
+      if (active.mode === 'pan') active = null;
+      else finishAction(false);
+    } else if (now - active.t > 1500) {
+      // Un dedo/ratón que dejó de dar señales: se considera terminado para no bloquear la entrada.
+      if (active.mode === 'pan') active = null;
+      else finishAction(true);
+    } else {
+      return;
+    }
   }
   e.preventDefault();
-  els.canvas.setPointerCapture(e.pointerId);
+  try { els.canvas.setPointerCapture(e.pointerId); } catch {}
   stopInertia();
 
   const rect = els.canvas.getBoundingClientRect();
@@ -1078,13 +1274,15 @@ function onCanvasDown(e) {
     const sel = state.tool === 'select' ? state.items[state.sel] : null;
     const grabbing = sel && (selectedHandleHit(x, y, rect) || hitItem(sel, x, y, 12 / rect.width, true));
     if (!grabbing) {
-      active = { id: e.pointerId, mode: 'pan', startY: e.clientY, lastY: e.clientY, lastT: e.timeStamp, v: 0, moved: false, x, y };
+      active = { id: e.pointerId, mode: 'pan', t: now, startY: e.clientY, lastY: e.clientY, lastT: e.timeStamp, v: 0, moved: false, x, y };
       return;
     }
   }
   beginAction(e, rect, x, y);
+  if (active) active.t = now;
 }
 els.canvas.addEventListener('pointerdown', onCanvasDown);
+els.canvas.addEventListener('pointermove', (e) => { if (e.pointerType === 'pen') lastPenAt = performance.now(); });
 
 // En una nota, tocar con el Pencil sobre la hoja pasa a dibujar sin tener que cambiar de herramienta.
 els.sheet.addEventListener('pointerdown', (e) => {
@@ -1150,6 +1348,7 @@ function beginAction(e, rect, x, y) {
 
 els.canvas.addEventListener('pointermove', (e) => {
   if (!active || e.pointerId !== active.id) return;
+  active.t = performance.now();
   const rect = els.canvas.getBoundingClientRect();
 
   switch (active.mode) {
@@ -1168,7 +1367,7 @@ els.canvas.addEventListener('pointermove', (e) => {
       for (const ev of events?.length ? events : [e]) {
         const prev = liveItem.p[liveItem.p.length - 1];
         const pt = toPoint(ev, rect, prev[2]);
-        if (pt[0] === prev[0] && pt[1] === prev[1]) continue;
+        if (Math.hypot(pt[0] - prev[0], pt[1] - prev[1]) * rect.width < 0.3) continue;
         liveItem.p.push(pt);
         setNormalized(lctx);
         lctx.strokeStyle = resolveColor(liveItem.c);
@@ -1238,7 +1437,14 @@ function applyTransform(orig, fx, fy, k) {
 function eraseAt(e, rect) {
   const [x, y] = pos(e, rect);
   const r = 14 / rect.width;
-  const kept = state.items.filter((it) => !hitItem(it, x, y, r, false));
+  // Se revisa todo el recorrido desde la posición anterior (no solo el punto actual), para no saltarse
+  // trazos finos cuando el Pencil se mueve rápido.
+  const from = active.last ?? [x, y];
+  active.last = [x, y];
+  const steps = Math.max(1, Math.ceil(Math.hypot(x - from[0], y - from[1]) / (r * 0.6)));
+  const samples = [];
+  for (let i = 1; i <= steps; i++) samples.push([from[0] + ((x - from[0]) * i) / steps, from[1] + ((y - from[1]) * i) / steps]);
+  const kept = state.items.filter((it) => !samples.some(([sx, sy]) => hitItem(it, sx, sy, r, false)));
   if (kept.length === state.items.length) return;
   if (!active.undoPushed) {
     pushUndo();
@@ -1251,9 +1457,12 @@ function eraseAt(e, rect) {
 
 function endAction(e) {
   if (!active || e.pointerId !== active.id) return;
+  finishAction(e.type === 'pointercancel');
+}
+
+function finishAction(cancelled) {
   const a = active;
   active = null;
-  const cancelled = e.type === 'pointercancel';
 
   switch (a.mode) {
     case 'pan': {
@@ -1279,11 +1488,13 @@ function endAction(e) {
       break;
     }
     case 'pen':
-      if (liveItem && !cancelled) {
-        pushUndo();
-        state.items = [...state.items, liveItem];
+      // Si el sistema cancela el gesto a media palabra, se conserva lo ya dibujado.
+      if (liveItem && (!cancelled || liveItem.p.length > 1)) {
+        const item = { ...liveItem, p: simplify(liveItem.p, 0.35 / els.sheet.offsetWidth) };
         liveItem = null;
-        redraw();
+        pushUndo();
+        state.items = [...state.items, item];
+        drawCommitted(item);
         commitDrawing();
       } else {
         liveItem = null;
@@ -1298,7 +1509,7 @@ function endAction(e) {
       if (!tiny && !cancelled) {
         pushUndo();
         state.items = [...state.items, s];
-        redraw();
+        drawCommitted(s);
         commitDrawing();
       } else {
         renderLive();
@@ -1316,15 +1527,73 @@ function endAction(e) {
 }
 els.canvas.addEventListener('pointerup', endAction);
 els.canvas.addEventListener('pointercancel', endAction);
+els.canvas.addEventListener('lostpointercapture', endAction);
 els.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+// ---------- Apariencia (automática / clara / oscura) ----------
+
+const themeMeta = $('#theme-meta');
+
+function themePref() {
+  try {
+    const m = localStorage.getItem('theme');
+    return m === 'light' || m === 'dark' ? m : 'auto';
+  } catch {
+    return 'auto';
+  }
+}
+
+function applyTheme(mode, { save = true } = {}) {
+  const root = document.documentElement;
+  if (mode === 'auto') delete root.dataset.theme;
+  else root.dataset.theme = mode;
+  if (save) {
+    try { mode === 'auto' ? localStorage.removeItem('theme') : localStorage.setItem('theme', mode); } catch {}
+  }
+  $$('#theme-picker button').forEach((b) => {
+    const on = b.dataset.themeMode === mode;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-checked', String(on));
+  });
+  themeMeta.content = getComputedStyle(root).getPropertyValue('--bg').trim(); // barra de estado / ventana de la PWA
+  redraw(); // la tinta "automática" cambia de color con el tema
+  renderLive();
+}
+$$('#theme-picker button').forEach((b) => b.addEventListener('click', () => applyTheme(b.dataset.themeMode)));
+applyTheme(themePref(), { save: false });
+
+// ---------- PWA ----------
+
+if ('serviceWorker' in navigator) {
+  addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+}
 
 // ---------- Arranque ----------
 
 (async function init() {
+  let user = null;
   try {
-    const user = await api('GET', '/api/me');
+    user = await api('GET', '/api/me');
+  } catch (err) {
+    if (err.status) return; // 401: api() ya mostró la pantalla de acceso
+    // Sin conexión con el servidor: se entra con el último usuario y sus notas guardadas en este dispositivo.
+    try { user = JSON.parse(localStorage.getItem('lastUser') || 'null'); } catch {}
+    if (!user?.id) {
+      showAuth();
+      els.authError.textContent = 'Sin conexión con el servidor. Inténtalo de nuevo cuando tengas internet.';
+      return;
+    }
+  }
+  try {
     await startApp(user);
-  } catch {
+    // Accesos directos de la app instalada (/?new=note | /?new=canvas)
+    const want = new URLSearchParams(location.search).get('new');
+    if (want === 'note' || want === 'canvas') {
+      history.replaceState(null, '', location.pathname);
+      await createNote(want);
+    }
+  } catch (err) {
+    console.error(err);
     showAuth();
   }
 })();

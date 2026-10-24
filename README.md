@@ -17,6 +17,31 @@ Las tablas se crean solas al iniciar. Para usar otra base de datos, copia `.env.
 Abre `http://<ip-de-tu-mac>:3000` en Safari (mismo Wi‑Fi) y usa *Compartir → Añadir a pantalla de inicio* para verla a pantalla completa.
 Para uso fuera de casa, ponla detrás de HTTPS (Caddy, Nginx, Cloudflare Tunnel…) y arranca con `NODE_ENV=production TRUST_PROXY=1`.
 
+## Apariencia
+
+Abajo a la izquierda eliges **Automático** (sigue al sistema), **Claro** u **Oscuro**. Se recuerda en cada dispositivo. El fondo es liso, sin colores.
+
+## Instalarla como app (PWA)
+
+- **iPad/iPhone:** Safari → Compartir → *Añadir a pantalla de inicio*.
+- **Mac/Android/PC:** botón *Instalar* de Chrome o Edge en la barra de direcciones.
+- Hay accesos directos al mantener pulsado el icono: *Nueva nota* y *Nuevo lienzo*.
+- El service worker (la app abre sin conexión) solo funciona en **HTTPS** o en `localhost`. Por `http://<ip-de-tu-mac>:3000` se puede añadir a la pantalla de inicio, pero sin service worker. Para HTTPS fuera de casa usa Cloudflare Tunnel, Tailscale Serve, Caddy, etc.
+- La red va primero: siempre intenta cargar la versión nueva y solo usa la copia guardada si no hay conexión, así nunca se queda atascada una versión vieja.
+
+## Sin conexión y sincronización
+
+Las notas se guardan primero **en el dispositivo** (IndexedDB) y se envían al servidor cuando hay conexión:
+
+- Puedes **ver, crear, editar, dibujar, fijar, buscar y borrar** sin conexión, incluso recargando la app.
+- Arriba, junto a "Notas", aparece **"Sin conexión · N pendientes"**; las notas aún sin enviar tienen un punto naranja.
+- Al volver la conexión se sincroniza solo (también al abrir la app, al volver a ella y cada 45 s). Tocar el indicador reintenta al momento.
+- Los cambios hechos en otros dispositivos se bajan en cada sincronización. La nota que estás editando no se pisa.
+- **Conflictos:** si editas la misma nota sin conexión y en otro dispositivo, se conserva la versión del servidor y la tuya se guarda como copia `"Título (conflicto)"`. No se pierde texto ni dibujos.
+- Cerrar sesión necesita conexión (así no se pierden cambios sin enviar) y **borra las copias locales** de ese dispositivo.
+- Safari no permite sincronizar con la app cerrada: lo pendiente se envía la próxima vez que la abras.
+- La primera vez en un dispositivo hace falta conexión para descargar las notas.
+
 ## Notas y lienzos
 
 El botón **+** crea:

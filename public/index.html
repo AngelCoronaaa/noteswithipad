@@ -5,16 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="Notas">
-  <meta name="theme-color" content="#e9eefb">
+  <meta name="application-name" content="Notas">
+  <meta name="description" content="Notas y lienzos con Apple Pencil">
+  <meta name="theme-color" id="theme-meta" content="#f1f2f5">
   <title>Notas</title>
+  <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <script src="theme.js"></script>
   <link rel="stylesheet" href="app.css">
 </head>
 <body>
-  <div class="backdrop" aria-hidden="true"><i></i><i></i><i></i></div>
-
   <svg class="sprite" width="0" height="0" aria-hidden="true">
     <defs>
       <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
@@ -36,6 +39,9 @@
       <symbol id="i-smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8.5 14.5c1 1.5 2.2 2.2 3.5 2.2s2.5-.7 3.5-2.2M9 9.5h.01M15 9.5h.01"/></symbol>
       <symbol id="i-cursor" viewBox="0 0 24 24"><path d="M5.5 3.5l13 6.5-5.5 1.8-1.8 5.7z"/><path d="M13 12l5 5"/></symbol>
       <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V6.5A2.5 2.5 0 017.5 4H15"/></symbol>
+      <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M18.7 5.3l-1.6 1.6M6.9 17.1l-1.6 1.6"/></symbol>
+      <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.2A8 8 0 019.8 4 8 8 0 1020 14.2z"/></symbol>
+      <symbol id="i-auto" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 010 17z" fill="currentColor"/></symbol>
       <symbol id="i-blank" viewBox="0 0 24 24"><rect x="5" y="3.5" width="14" height="17" rx="2.5"/></symbol>
       <symbol id="i-grid" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2.5"/><path d="M4 9.3h16M4 14.7h16M9.3 4v16M14.7 4v16"/></symbol>
       <symbol id="i-lines" viewBox="0 0 24 24"><path d="M4 6.5h16M4 12h16M4 17.5h16"/></symbol>
@@ -70,6 +76,7 @@
     <aside class="sidebar glass">
       <header class="side-head">
         <h2>Notas</h2>
+        <button id="net" class="net" type="button" hidden></button>
         <button id="new-note" class="icon-btn accent" title="Nuevo" aria-label="Nuevo" aria-haspopup="menu" aria-expanded="false"><svg><use href="#i-plus"/></svg></button>
         <div id="new-menu" class="menu glass" role="menu" hidden>
           <button role="menuitem" data-kind="note"><svg><use href="#i-type"/></svg><span>Nota<small>Texto y dibujo encima</small></span></button>
@@ -82,7 +89,14 @@
       </label>
       <ul id="note-list" class="note-list"></ul>
       <footer class="side-foot">
-        <span id="whoami" class="muted"></span>
+        <span class="muted who"><span id="whoami"></span> <span class="ver">· v6</span></span>
+        <div class="grow">
+          <div id="theme-picker" class="theme-picker" role="radiogroup" aria-label="Apariencia">
+            <button data-theme-mode="auto" role="radio" title="Automático (sistema)" aria-label="Automático"><svg><use href="#i-auto"/></svg></button>
+            <button data-theme-mode="light" role="radio" title="Claro" aria-label="Claro"><svg><use href="#i-sun"/></svg></button>
+            <button data-theme-mode="dark" role="radio" title="Oscuro" aria-label="Oscuro"><svg><use href="#i-moon"/></svg></button>
+          </div>
+        </div>
         <button id="logout" class="icon-btn" title="Cerrar sesión" aria-label="Cerrar sesión"><svg><use href="#i-logout"/></svg></button>
       </footer>
     </aside>
@@ -166,6 +180,8 @@
       </div>
     </section>
   </div>
+
+  <div id="toast" class="toast glass" role="status" hidden></div>
 
   <script src="app.js" type="module"></script>
 </body>

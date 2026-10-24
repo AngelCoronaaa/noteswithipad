@@ -143,7 +143,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '30mb' }));
 
 // Bloquea peticiones de escritura que no sean JSON (mitiga CSRF junto con SameSite=Lax).
 app.use('/api', (req, res, next) => {
@@ -153,7 +153,10 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
+// Siempre revalida (ETag): evita que Safari/PWA siga mostrando una versión vieja de la app.
+app.use(express.static(path.join(__dirname, 'public'), {
+  setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache'),
+}));
 
 // ----- auth -----
 
@@ -261,44 +264,107 @@ app.get('/api/notes/:id', requireUser, async (req, res, next) => {
   }
 });
 
+// Serialización estable (claves ordenadas) para comparar JSON sin depender del orden de las claves.
+function canon(v) {
+  if (Array.isArray(v)) return `[${v.map(canon).join(',')}]`;
+  if (v && typeof v === 'object') return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canon(v[k])}`).join(',')}}`;
+  return JSON.stringify(v ?? null);
+}
+
+const FULL_COLUMNS = 'id, title, kind, paper, body, drawing, pinned, updated_at';
+
+// Crea o actualiza una nota. Pensado para sincronización sin conexión:
+//  - `create` + id del cliente: crea la nota si no existe (y es idempotente si se reintenta).
+//  - `base`: updated_at que el cliente conocía. Si la nota cambió desde entonces en el servidor y el cliente
+//    quiere pisar título/texto/dibujo con otro valor, responde 409 con la versión del servidor (no se pierde nada).
 app.put('/api/notes/:id', requireUser, async (req, res, next) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'No encontrada' });
+  const b = req.body ?? {};
+  const fields = {};
+  if ('title' in b) fields.title = String(b.title).slice(0, 300);
+  if ('body' in b) fields.body = String(b.body).slice(0, 500_000);
+  if ('pinned' in b) fields.pinned = Boolean(b.pinned);
+  if ('paper' in b) {
+    if (!PAPERS.includes(b.paper)) return res.status(400).json({ error: 'Papel inválido' });
+    fields.paper = b.paper;
+  }
+  if ('drawing' in b) {
+    if (b.drawing !== null && (typeof b.drawing !== 'object' || !Array.isArray(b.drawing.strokes))) {
+      return res.status(400).json({ error: 'Dibujo inválido' });
+    }
+    fields.drawing = b.drawing;
+  }
+  const create = b.create && typeof b.create === 'object' ? b.create : null;
+  const base = typeof b.base === 'string' && !Number.isNaN(Date.parse(b.base)) ? Date.parse(b.base) : null;
+  if (!Object.keys(fields).length && !create) return res.status(400).json({ error: 'Nada que actualizar' });
+
+  const client = await pool.connect();
   try {
-    if (!isUuid(req.params.id)) return res.status(404).json({ error: 'No encontrada' });
-    const b = req.body ?? {};
+    await client.query('BEGIN');
+    const select = () => client.query(`SELECT ${FULL_COLUMNS}, user_id FROM notes WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    let { rows } = await select();
+
+    if (!rows[0] && create) {
+      const kind = KINDS.includes(create.kind) ? create.kind : 'note';
+      const paper = fields.paper ?? (PAPERS.includes(create.paper) ? create.paper : 'blank');
+      const ins = await client.query(
+        `INSERT INTO notes (id, user_id, title, body, drawing, pinned, kind, paper)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
+         ON CONFLICT (id) DO NOTHING RETURNING ${LIST_COLUMNS}`,
+        [req.params.id, req.user.id, fields.title ?? '', fields.body ?? '', fields.drawing == null ? null : JSON.stringify(fields.drawing), fields.pinned ?? false, kind, paper]
+      );
+      if (ins.rows[0]) {
+        await client.query('COMMIT');
+        return res.status(201).json(ins.rows[0]);
+      }
+      ({ rows } = await select()); // otro intento simultáneo ya la creó: continúa como actualización
+    }
+
+    const row = rows[0];
+    if (!row || row.user_id !== req.user.id) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'No encontrada' });
+    }
+
+    if (base !== null && row.updated_at.getTime() > base) {
+      const conflicts = ['title', 'body', 'drawing'].filter((f) => f in fields && canon(fields[f]) !== canon(row[f]));
+      if (conflicts.length) {
+        await client.query('ROLLBACK');
+        const { user_id, ...server } = row;
+        return res.status(409).json({ error: 'conflict', fields: conflicts, server });
+      }
+    }
+
     const sets = [];
     const params = [req.params.id, req.user.id];
     const add = (col, value, cast = '') => {
       params.push(value);
       sets.push(`${col} = $${params.length}${cast}`);
     };
-
-    if ('title' in b) add('title', String(b.title).slice(0, 300));
-    if ('body' in b) add('body', String(b.body).slice(0, 500_000));
-    if ('pinned' in b) add('pinned', Boolean(b.pinned));
-    if ('paper' in b) {
-      if (!PAPERS.includes(b.paper)) return res.status(400).json({ error: 'Papel inválido' });
-      add('paper', b.paper);
+    if ('title' in fields) add('title', fields.title);
+    if ('body' in fields) add('body', fields.body);
+    if ('pinned' in fields) add('pinned', fields.pinned);
+    if ('paper' in fields) add('paper', fields.paper);
+    if ('drawing' in fields) add('drawing', fields.drawing === null ? null : JSON.stringify(fields.drawing), '::jsonb');
+    if (!sets.length) {
+      await client.query('COMMIT');
+      const cur = await pool.query(`SELECT ${LIST_COLUMNS} FROM notes WHERE id = $1`, [req.params.id]);
+      return res.json(cur.rows[0]);
     }
-    if ('drawing' in b) {
-      if (b.drawing !== null && (typeof b.drawing !== 'object' || !Array.isArray(b.drawing.strokes))) {
-        return res.status(400).json({ error: 'Dibujo inválido' });
-      }
-      add('drawing', b.drawing === null ? null : JSON.stringify(b.drawing), '::jsonb');
-    }
-    if (!sets.length) return res.status(400).json({ error: 'Nada que actualizar' });
-
     // El pin no debe mover la nota en "modificadas recientemente".
-    const touchUpdated = Object.keys(b).some((k) => k !== 'pinned');
-    if (touchUpdated) sets.push('updated_at = now()');
+    if (Object.keys(fields).some((k) => k !== 'pinned')) sets.push('updated_at = now()');
 
-    const { rows } = await pool.query(
+    const upd = await client.query(
       `UPDATE notes SET ${sets.join(', ')} WHERE id = $1 AND user_id = $2 RETURNING ${LIST_COLUMNS}`,
       params
     );
-    if (!rows[0]) return res.status(404).json({ error: 'No encontrada' });
-    res.json(rows[0]);
+    await client.query('COMMIT');
+    res.json(upd.rows[0]);
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     next(err);
+  } finally {
+    client.release();
   }
 });
 
