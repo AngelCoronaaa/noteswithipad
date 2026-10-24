@@ -3,7 +3,7 @@
 // así nunca se queda atascada una versión vieja. Las llamadas a /api no se guardan.
 const VERSION = '__V__'; // el servidor lo sustituye por el id del despliegue
 const CACHE = `notas-${VERSION}`;
-const SHELL = ['./', 'app.css', 'app.js', 'theme.js', 'store.js', 'sync.js', 'manifest.webmanifest']
+const SHELL = ['./', 'app.css', 'app.js', 'theme.js', 'store.js', 'sync.js', 'shapes.js', 'manifest.webmanifest']
   .map((f) => (f === './' ? f : `${f}?v=${VERSION}`))
   .concat(['favicon.svg', 'icons/icon-192.png', 'icons/icon-512.png']);
 

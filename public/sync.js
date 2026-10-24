@@ -47,6 +47,12 @@ export function createSync({ store, api, upload, download, uuid, hooks }) {
   async function run() {
     if (stopped) return;
     if (running) { again = true; return; }
+    if (hooks.isBusy?.()) {
+      // Se está escribiendo: se espera a una pausa para no bloquear el trazo.
+      clearTimeout(timer);
+      timer = setTimeout(run, 1000);
+      return;
+    }
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
       await emit('offline'); // el evento "online" vuelve a lanzar la sincronización
       return;

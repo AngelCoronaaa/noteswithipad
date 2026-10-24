@@ -1,5 +1,6 @@
 import { openStore, newLocalNote, newLocalFile } from './store.js?v=__V__';
 import { createSync } from './sync.js?v=__V__';
+import { recognizeShape } from './shapes.js?v=__V__';
 
 const BUILD = '__V__'; // el servidor lo sustituye por el id del despliegue
 
@@ -95,6 +96,7 @@ const state = {
   shape: 'rect',
   shapeFill: false,
   sticker: '⭐',
+  snapShapes: true,     // formas perfectas al mantener el lápiz quieto
   fingerDraws: false,
   query: '',
   filter: 'all',        // all | note | canvas | file
@@ -116,8 +118,8 @@ state.tool = 'text';
 state.sel = null;
 
 function savePrefs() {
-  const { pen, color, mult, shape, shapeFill, sticker } = state;
-  try { localStorage.setItem('prefs', JSON.stringify({ pen, color, mult, shape, shapeFill, sticker })); } catch {}
+  const { pen, color, mult, shape, shapeFill, sticker, snapShapes } = state;
+  try { localStorage.setItem('prefs', JSON.stringify({ pen, color, mult, shape, shapeFill, sticker, snapShapes })); } catch {}
 }
 
 const els = {
@@ -265,6 +267,7 @@ async function startApp(user) {
 }
 
 const syncHooks = {
+  isBusy: () => isWriting(),
   onState(s, pending) {
     netState = { s, pending };
     renderNet();
@@ -435,6 +438,7 @@ let thumbQueue = Promise.resolve();
 const themeKey = () => getComputedStyle(document.documentElement).getPropertyValue('--ink').trim();
 
 function renderHub() {
+  if (els.app.dataset.view !== 'hub') return; // se dibuja al volver al inicio
   const q = state.query.toLowerCase();
   const matches = state.entries.filter((e) => !q || e.search.includes(q));
   const counts = { all: matches.length, note: 0, canvas: 0, file: 0 };
@@ -760,6 +764,7 @@ async function openNote(id, { focusTitle = false, keepView = false, from = null 
       if (canvasKind) setTool(state.tool === 'text' ? 'pen' : state.tool);
       else setTool(state.items.length && !note.body ? 'pen' : 'text');
     }
+    canvasNoteId = null;
     syncCanvasSize();
     updateHistoryButtons();
   };
@@ -777,6 +782,7 @@ function refreshOpenNote(id) {
 
 async function closeNote() {
   await flush().catch(() => {});
+  await loadNotes(); // (no dibuja: aún no se ve el inicio) datos frescos para la transición
   const id = state.current?.id;
   await transition(() => {
     state.current = null;
@@ -865,6 +871,7 @@ async function deleteNote(id) {
   const open = state.current?.id === id;
   if (open) {
     clearTimeout(saveTimer);
+    saveTimer = null;
     dirty.clear();
   }
   await store.remove(id);
@@ -1325,12 +1332,32 @@ function updateStatus() {
   setStatus('Guardado · sincronizando…');
 }
 
+// Escribiendo con el Pencil (o justo después): se evita cualquier trabajo pesado (guardar, sincronizar,
+// miniaturas) porque bloquearía el hilo principal y Safari podría cortar el trazo siguiente.
+const WRITE_PAUSE_MS = 1500;
+const FORCE_SAVE_MS = 20000;
+let firstDirtyAt = 0;
+let lastStrokeAt = -Infinity;
+const isWriting = () => active !== null || penDown || performance.now() - Math.max(lastPenAt, lastStrokeAt) < WRITE_PAUSE_MS;
+
 function markDirty(field) {
+  if (!dirty.size) firstDirtyAt = performance.now();
   dirty.add(field);
   lastEditAt = performance.now();
   setStatus('Guardando…');
+  // Cada cambio pospone el guardado, salvo que ya lleve 20 s pendiente: entonces el temporizador sigue su curso.
+  if (!saveTimer || performance.now() - firstDirtyAt < FORCE_SAVE_MS) scheduleFlush(600);
+}
+
+function scheduleFlush(ms) {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => flush().catch(() => {}), 600);
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    // Si se sigue escribiendo, se espera a una pausa; tras 20 s se guarda igual, pero nunca con el lápiz apoyado.
+    const overdue = performance.now() - firstDirtyAt > FORCE_SAVE_MS;
+    if (isWriting() && !(overdue && active === null && !penDown)) return scheduleFlush(400);
+    flush().catch(() => {});
+  }, ms);
 }
 
 function drawingPayload() {
@@ -1341,6 +1368,7 @@ function drawingPayload() {
 
 function flush() {
   clearTimeout(saveTimer);
+  saveTimer = null;
   // Serializa los guardados para que no se pisen entre sí.
   const run = saving.then(async () => {
     if (!state.current || !dirty.size || !store) return;
@@ -1361,8 +1389,10 @@ function flush() {
       setStatus(err?.name === 'QuotaExceededError' ? 'No hay espacio para guardar en este dispositivo' : 'No se pudo guardar en el dispositivo', true);
       throw err;
     }
-    await loadNotes();
-    sync.schedule();
+    state.pendingIds.add(id);
+    updateStatus();
+    if (els.app.dataset.view === 'hub') await loadNotes();
+    sync.schedule({ ms: 1200 });
   });
   saving = run.catch(() => {}); // un fallo no debe bloquear los guardados siguientes
   return run;
@@ -1487,6 +1517,10 @@ function buildPanels() {
     });
     shapeList.append(b);
   }
+  $('#snap-shapes').addEventListener('change', (e) => {
+    state.snapShapes = e.target.checked;
+    savePrefs();
+  });
   $('#shape-fill').addEventListener('change', (e) => {
     state.shapeFill = e.target.checked;
     savePrefs();
@@ -1533,6 +1567,7 @@ function syncPanels() {
   $$('.shape-btn').forEach((b) => b.classList.toggle('on', b.dataset.shape === state.shape));
   $$('.sticker-btn').forEach((b) => b.classList.toggle('on', b.dataset.sticker === state.sticker));
   $('#shape-fill').checked = state.shapeFill;
+  $('#snap-shapes').checked = state.snapShapes;
   $('#size').value = $('#size2').value = String(state.mult);
   syncColorButton();
 }
@@ -1551,7 +1586,7 @@ $('#more-page').addEventListener('click', extendSheet);
 function extendSheet() {
   const h = els.sheet.offsetHeight / els.sheet.offsetWidth;
   if (h >= MAX_SHEET_H) return;
-  els.sheet.style.setProperty('--sheet-h', String(Math.round((h + 0.5) * 100) / 100));
+  els.sheet.style.setProperty('--sheet-h', String(Math.round((h + 0.8) * 100) / 100));
   markDirty('drawing');
 }
 
@@ -1713,15 +1748,31 @@ function syncCanvasSize() {
   const dpr = Math.min(window.devicePixelRatio || 1, Math.sqrt(MAX_CANVAS_PX / Math.max(1, rect.width * rect.height)));
   const w = Math.max(1, Math.round(rect.width * dpr));
   const h = Math.max(1, Math.round(rect.height * dpr));
-  if (els.canvas.width !== w || els.canvas.height !== h) {
-    for (const c of [els.canvas, els.live]) {
-      c.width = w;
-      c.height = h;
-    }
+  if (els.canvas.width === w && els.canvas.height === h && canvasNoteId === state.current?.id) return;
+  // Misma nota, mismo ancho y la hoja solo creció hacia abajo: se conserva lo dibujado (copia rápida).
+  const grow = canvasNoteId === state.current?.id && els.canvas.width === w && h > els.canvas.height;
+  let snap = null;
+  if (grow) {
+    snap = document.createElement('canvas');
+    snap.width = w;
+    snap.height = els.canvas.height;
+    snap.getContext('2d').drawImage(els.canvas, 0, 0);
   }
-  redraw();
+  for (const c of [els.canvas, els.live]) {
+    c.width = w;
+    c.height = h;
+  }
+  if (snap) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(snap, 0, 0);
+    snap.width = snap.height = 0; // libera memoria enseguida (Safari)
+  } else {
+    redraw();
+  }
+  canvasNoteId = state.current?.id;
   renderLive();
 }
+let canvasNoteId = null; // nota cuyo dibujo está ahora en el canvas
 new ResizeObserver(syncCanvasSize).observe(els.sheet);
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme(themePref(), { save: false }));
 
@@ -1738,9 +1789,25 @@ function drawStroke(c, it) {
   const pen = penOf(it);
   const color = resolveColor(it.c);
   c.strokeStyle = c.fillStyle = color;
-  c.lineCap = pen.flat ? 'square' : 'round';
+  c.lineCap = 'round';
   c.lineJoin = 'round';
   const p = it.p;
+  if (pen.lo === pen.hi && p.length > 1) {
+    // Ancho constante (resaltador, marcador): un solo trazo continuo, sin uniones ni dientes.
+    // El resaltador tiene punta plana; las formas reconocidas (it.sh) conservan sus esquinas.
+    c.lineCap = pen.flat ? 'butt' : 'round';
+    c.lineWidth = strokeW(it, 0.5);
+    c.beginPath();
+    c.moveTo(p[0][0], p[0][1]);
+    if (it.sh) {
+      for (let i = 1; i < p.length; i++) c.lineTo(p[i][0], p[i][1]);
+    } else {
+      for (let i = 1; i < p.length - 1; i++) c.quadraticCurveTo(p[i][0], p[i][1], (p[i][0] + p[i + 1][0]) / 2, (p[i][1] + p[i + 1][1]) / 2);
+      c.lineTo(p[p.length - 1][0], p[p.length - 1][1]);
+    }
+    c.stroke();
+    return;
+  }
   if (p.length === 1) {
     c.beginPath();
     c.arc(p[0][0], p[0][1], strokeW(it, p[0][2]) / 2, 0, Math.PI * 2);
@@ -2183,6 +2250,30 @@ els.sheet.addEventListener('pointerdown', (e) => {
   onCanvasDown(e);
 }, true);
 
+// ---------- Formas perfectas ----------
+// Si al terminar un trazo el lápiz se queda quieto un momento, el trazo se reemplaza por la forma limpia
+// que se reconozca (línea, círculo, elipse, rectángulo, triángulo, polígono o línea quebrada).
+const HOLD_MS = 550;
+const HOLD_MOVE_PX = 4;
+
+function armHold(a, e) {
+  a.holdX = e.clientX;
+  a.holdY = e.clientY;
+  clearTimeout(a.holdTimer);
+  a.holdTimer = setTimeout(() => snapToShape(a), HOLD_MS);
+}
+
+function snapToShape(a) {
+  if (active !== a || a.mode !== 'pen' || !liveItem || liveItem.sh || liveItem.p.length < 3) return;
+  const W = els.canvas.getBoundingClientRect().width;
+  const shape = recognizeShape(liveItem.p.map(([x, y]) => [x * W, y * W]));
+  if (!shape) return;
+  const pressures = liveItem.p.map((p) => p[2]).sort((x, y) => x - y);
+  const pr = pressures[Math.floor(pressures.length / 2)]; // grosor uniforme (mediana de la presión)
+  liveItem = { ...liveItem, sh: 1, p: shape.points.map(([x, y]) => [round4(x / W), round4(y / W), pr]) };
+  renderLive();
+}
+
 function placeSticker(x, y) {
   pushUndo();
   const item = { t: 'sticker', e: state.sticker, x, y, s: 0.11 };
@@ -2206,6 +2297,7 @@ function beginAction(e, rect, x, y) {
       active = { id, mode, undoPushed: false };
       if (mode === 'pen') {
         liveItem = { k: state.pen, c: state.color, w: round4(PENS[state.pen].w * state.mult), p: [toPoint(e, rect)] };
+        if (state.snapShapes) armHold(active, e);
         renderLive();
       } else {
         eraseAt(e, rect);
@@ -2253,17 +2345,24 @@ els.canvas.addEventListener('pointermove', (e) => {
       break;
     }
     case 'pen': {
+      if (liveItem.sh) break; // ya se convirtió en forma: se ignora el resto hasta levantar el lápiz
+      const pen = penOf(liveItem);
+      const constant = pen.lo === pen.hi;
       const events = e.getCoalescedEvents?.();
       for (const ev of events?.length ? events : [e]) {
         const prev = liveItem.p[liveItem.p.length - 1];
         const pt = toPoint(ev, rect, prev[2]);
         if (Math.hypot(pt[0] - prev[0], pt[1] - prev[1]) * rect.width < 0.3) continue;
         liveItem.p.push(pt);
-        setNormalized(lctx);
-        lctx.strokeStyle = resolveColor(liveItem.c);
-        lctx.lineCap = penOf(liveItem).flat ? 'square' : 'round';
-        strokeSegment(lctx, liveItem, prev, pt);
+        if (!constant) {
+          setNormalized(lctx);
+          lctx.strokeStyle = resolveColor(liveItem.c);
+          lctx.lineCap = 'round';
+          strokeSegment(lctx, liveItem, prev, pt);
+        }
       }
+      if (constant) renderLive(); // un solo trazo suavizado (sin uniones visibles)
+      if (state.snapShapes && Math.hypot(e.clientX - active.holdX, e.clientY - active.holdY) > HOLD_MOVE_PX) armHold(active, e);
       const last = liveItem.p[liveItem.p.length - 1];
       if (last[1] * rect.width > rect.height - 160) extendSheet();
       break;
@@ -2353,6 +2452,8 @@ function endAction(e) {
 function finishAction(cancelled) {
   const a = active;
   active = null;
+  clearTimeout(a.holdTimer);
+  if (a.mode !== 'pan' && a.mode !== 'none') lastStrokeAt = performance.now();
 
   switch (a.mode) {
     case 'pan': {
@@ -2380,7 +2481,7 @@ function finishAction(cancelled) {
     case 'pen':
       // Si el sistema cancela el gesto a media palabra, se conserva lo ya dibujado.
       if (liveItem && (!cancelled || liveItem.p.length > 1)) {
-        const item = { ...liveItem, p: simplify(liveItem.p, 0.35 / els.sheet.offsetWidth) };
+        const item = liveItem.sh ? liveItem : { ...liveItem, p: simplify(liveItem.p, 0.35 / els.sheet.offsetWidth) };
         liveItem = null;
         pushUndo();
         state.items = [...state.items, item];
