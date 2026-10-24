@@ -258,8 +258,12 @@ $$('button', els.newMenu).forEach((b) =>
     toggleNewMenu(false);
     await flush().catch(() => {});
     const note = await api('POST', '/api/notes', { kind: b.dataset.kind });
+    if (note.kind === undefined && b.dataset.kind === 'canvas') {
+      alert('El servidor está desactualizado y no soporta lienzos. Deténlo y vuelve a iniciarlo con npm start.');
+    }
     state.notes.unshift(note);
     await openNote(note.id, { focusTitle: true });
+    if (b.dataset.kind === 'canvas') openPop('pen'); // muestra lápices y colores al crear un lienzo
   })
 );
 document.addEventListener('pointerdown', (e) => {
@@ -272,6 +276,9 @@ document.addEventListener('pointerdown', (e) => {
 async function openNote(id, { focusTitle = false } = {}) {
   await flush().catch(() => {});
   const note = await api('GET', `/api/notes/${id}`);
+  const staleServer = note.kind === undefined;
+  note.kind ??= 'note';
+  note.paper ??= 'blank';
   state.current = { id: note.id, title: note.title, body: note.body, pinned: note.pinned, kind: note.kind, paper: note.paper };
   state.items = Array.isArray(note.drawing?.strokes) ? note.drawing.strokes : [];
   state.undo = [];
@@ -291,7 +298,8 @@ async function openNote(id, { focusTitle = false } = {}) {
   syncPaperPicker();
   els.sheet.style.setProperty('--sheet-h', String(note.drawing?.h ?? DEFAULT_SHEET_H[note.kind]));
   els.pin.setAttribute('aria-pressed', String(note.pinned));
-  setStatus('');
+  if (staleServer) setStatus('Servidor desactualizado: reinícialo con npm start', true);
+  else setStatus('');
 
   els.empty.hidden = true;
   els.noteView.hidden = false;
@@ -484,8 +492,7 @@ $$('.tool[data-tool]').forEach((b) =>
     const tool = b.dataset.tool;
     const again = state.tool === tool;
     setTool(tool);
-    if (tool === 'pen') { if (again) togglePop('pen'); else closePop(); }
-    else if (tool === 'shape' || tool === 'sticker') { if (again) togglePop(tool); else openPop(tool); }
+    if (tool === 'pen' || tool === 'shape' || tool === 'sticker') { if (again) togglePop(tool); else openPop(tool); }
   })
 );
 els.colorBtn.addEventListener('click', () => togglePop('color'));
@@ -1051,7 +1058,7 @@ function itemAt(x, y, rect) {
   return -1;
 }
 
-els.canvas.addEventListener('pointerdown', (e) => {
+function onCanvasDown(e) {
   if (state.tool === 'text') return;
   if (e.pointerType === 'mouse' && e.button !== 0) return;
   if (active) {
@@ -1076,7 +1083,17 @@ els.canvas.addEventListener('pointerdown', (e) => {
     }
   }
   beginAction(e, rect, x, y);
-});
+}
+els.canvas.addEventListener('pointerdown', onCanvasDown);
+
+// En una nota, tocar con el Pencil sobre la hoja pasa a dibujar sin tener que cambiar de herramienta.
+els.sheet.addEventListener('pointerdown', (e) => {
+  if (e.pointerType !== 'pen' || state.tool !== 'text' || !state.current || e.target === els.canvas) return;
+  e.preventDefault();
+  setTool('pen');
+  closePop();
+  onCanvasDown(e);
+}, true);
 
 function placeSticker(x, y) {
   pushUndo();
