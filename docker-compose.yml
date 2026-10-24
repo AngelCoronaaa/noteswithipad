@@ -1,0 +1,15 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: notes
+      POSTGRES_PASSWORD: notes
+      POSTGRES_DB: notes
+    ports:
+      - "5433:5432"
+    volumes:
+      - notes-data:/var/lib/postgresql/data
+
+volumes:
+  notes-data:
