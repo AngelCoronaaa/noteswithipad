@@ -31,6 +31,15 @@
       <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5V3h4M16 17l5-5-5-5M21 12H9"/></symbol>
       <symbol id="i-page" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M5 20h14"/></symbol>
       <symbol id="i-scribble" viewBox="0 0 24 24"><path d="M4 16c3-6 5-9 7-9s0 8 2 8 3-5 7-7"/></symbol>
+      <symbol id="i-canvas" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="16" rx="3"/><path d="M7.5 15c1.5-4 3-6 4.5-6s.5 5 2 5 1.5-2 2.5-3"/></symbol>
+      <symbol id="i-shapes" viewBox="0 0 24 24"><rect x="3" y="3.5" width="11" height="11" rx="2.5"/><circle cx="15.5" cy="15.5" r="5.5"/></symbol>
+      <symbol id="i-smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8.5 14.5c1 1.5 2.2 2.2 3.5 2.2s2.5-.7 3.5-2.2M9 9.5h.01M15 9.5h.01"/></symbol>
+      <symbol id="i-cursor" viewBox="0 0 24 24"><path d="M5.5 3.5l13 6.5-5.5 1.8-1.8 5.7z"/><path d="M13 12l5 5"/></symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V6.5A2.5 2.5 0 017.5 4H15"/></symbol>
+      <symbol id="i-blank" viewBox="0 0 24 24"><rect x="5" y="3.5" width="14" height="17" rx="2.5"/></symbol>
+      <symbol id="i-grid" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2.5"/><path d="M4 9.3h16M4 14.7h16M9.3 4v16M14.7 4v16"/></symbol>
+      <symbol id="i-lines" viewBox="0 0 24 24"><path d="M4 6.5h16M4 12h16M4 17.5h16"/></symbol>
+      <symbol id="i-dots" viewBox="0 0 24 24"><path stroke-width="3" d="M6.5 6.5h.01M12 6.5h.01M17.5 6.5h.01M6.5 12h.01M12 12h.01M17.5 12h.01M6.5 17.5h.01M12 17.5h.01M17.5 17.5h.01"/></symbol>
     </defs>
   </svg>
 
@@ -61,7 +70,11 @@
     <aside class="sidebar glass">
       <header class="side-head">
         <h2>Notas</h2>
-        <button id="new-note" class="icon-btn accent" title="Nueva nota" aria-label="Nueva nota"><svg><use href="#i-plus"/></svg></button>
+        <button id="new-note" class="icon-btn accent" title="Nuevo" aria-label="Nuevo" aria-haspopup="menu" aria-expanded="false"><svg><use href="#i-plus"/></svg></button>
+        <div id="new-menu" class="menu glass" role="menu" hidden>
+          <button role="menuitem" data-kind="note"><svg><use href="#i-type"/></svg><span>Nota<small>Texto y dibujo encima</small></span></button>
+          <button role="menuitem" data-kind="canvas"><svg><use href="#i-canvas"/></svg><span>Lienzo<small>Hoja libre para dibujar</small></span></button>
+        </div>
       </header>
       <label class="search">
         <svg><use href="#i-search"/></svg>
@@ -77,46 +90,71 @@
     <section class="editor">
       <div id="empty" class="empty">
         <svg><use href="#i-scribble"/></svg>
-        <p>Selecciona o crea una nota</p>
+        <p>Selecciona o crea una nota o un lienzo</p>
       </div>
 
       <div id="note-view" class="note-view" hidden>
         <header class="note-bar">
           <button id="back" class="icon-btn glass-pill only-compact" aria-label="Notas"><svg><use href="#i-back"/></svg></button>
+          <input id="ctitle" class="ctitle glass-pill" placeholder="Título del lienzo" autocomplete="off" hidden>
           <span id="status" class="status glass-pill" aria-live="polite"></span>
           <div class="spacer"></div>
+          <div id="paper-picker" class="paper-picker glass-pill" role="radiogroup" aria-label="Papel" hidden>
+            <button data-paper="blank" title="Hoja en blanco" aria-label="Hoja en blanco"><svg><use href="#i-blank"/></svg></button>
+            <button data-paper="grid" title="Cuadrícula" aria-label="Cuadrícula"><svg><use href="#i-grid"/></svg></button>
+            <button data-paper="lined" title="Rayada" aria-label="Rayada"><svg><use href="#i-lines"/></svg></button>
+            <button data-paper="dots" title="Puntos" aria-label="Puntos"><svg><use href="#i-dots"/></svg></button>
+          </div>
           <button id="pin" class="icon-btn glass-pill" title="Fijar" aria-label="Fijar" aria-pressed="false"><svg><use href="#i-pin"/></svg></button>
           <button id="delete" class="icon-btn glass-pill" title="Eliminar" aria-label="Eliminar"><svg><use href="#i-trash"/></svg></button>
         </header>
 
         <div id="scroller" class="scroller">
           <div class="sheet-wrap">
-            <div id="sheet" class="sheet">
+            <div id="sheet" class="sheet" data-paper="blank">
               <input id="title" class="title" placeholder="Título" autocomplete="off" enterkeyhint="next">
               <textarea id="body" class="body" placeholder="Escribe o dibuja con el Apple Pencil…" spellcheck="true"></textarea>
               <canvas id="canvas" class="canvas"></canvas>
+              <canvas id="live" class="canvas live"></canvas>
+              <div id="sel-ui" class="sel-ui glass-pill" hidden>
+                <button id="sel-copy" title="Duplicar" aria-label="Duplicar"><svg><use href="#i-copy"/></svg></button>
+                <button id="sel-del" title="Eliminar" aria-label="Eliminar"><svg><use href="#i-trash"/></svg></button>
+              </div>
             </div>
+          </div>
+        </div>
+
+        <!-- Paneles de herramientas -->
+        <div id="pop" class="pop glass" hidden>
+          <div class="pop-sec" data-pop="pen">
+            <div id="pen-list" class="pen-list"></div>
+            <label class="slider"><span>Grosor</span><input id="size" type="range" min="0.4" max="4" step="0.1" value="1"></label>
+          </div>
+          <div class="pop-sec" data-pop="color">
+            <div id="palette" class="palette"></div>
+            <label class="custom-color"><span>Personalizado</span><input id="custom-color" type="color" value="#0a84ff"></label>
+          </div>
+          <div class="pop-sec" data-pop="shape">
+            <div id="shape-list" class="shape-list"></div>
+            <label class="toggle"><input id="shape-fill" type="checkbox"><span>Relleno</span></label>
+            <label class="slider"><span>Grosor</span><input id="size2" type="range" min="0.4" max="4" step="0.1" value="1"></label>
+          </div>
+          <div class="pop-sec" data-pop="sticker">
+            <div id="sticker-list" class="sticker-list"></div>
           </div>
         </div>
 
         <div class="toolbar glass" role="toolbar" aria-label="Herramientas">
           <div class="group">
-            <button class="tool" data-tool="text" title="Texto" aria-label="Texto"><svg><use href="#i-type"/></svg></button>
+            <button class="tool note-only" data-tool="text" title="Texto" aria-label="Texto"><svg><use href="#i-type"/></svg></button>
             <button class="tool" data-tool="pen" title="Lápiz" aria-label="Lápiz"><svg><use href="#i-pen"/></svg></button>
             <button class="tool" data-tool="eraser" title="Borrador" aria-label="Borrador"><svg><use href="#i-eraser"/></svg></button>
+            <button class="tool" data-tool="shape" title="Formas" aria-label="Formas"><svg><use href="#i-shapes"/></svg></button>
+            <button class="tool" data-tool="sticker" title="Stickers" aria-label="Stickers"><svg><use href="#i-smile"/></svg></button>
+            <button class="tool" data-tool="select" title="Seleccionar y mover" aria-label="Seleccionar"><svg><use href="#i-cursor"/></svg></button>
           </div>
           <div class="group draw-only">
-            <button class="swatch" data-color="ink" aria-label="Tinta"></button>
-            <button class="swatch" data-color="#0a84ff" aria-label="Azul"></button>
-            <button class="swatch" data-color="#ff453a" aria-label="Rojo"></button>
-            <button class="swatch" data-color="#30d158" aria-label="Verde"></button>
-            <button class="swatch" data-color="#ff9f0a" aria-label="Naranja"></button>
-            <button class="swatch" data-color="#bf5af2" aria-label="Morado"></button>
-          </div>
-          <div class="group draw-only">
-            <button class="size" data-size="1.6" aria-label="Fino"><i></i></button>
-            <button class="size" data-size="3.4" aria-label="Medio"><i></i></button>
-            <button class="size" data-size="7" aria-label="Grueso"><i></i></button>
+            <button id="color-btn" class="color-btn" title="Color" aria-label="Color"></button>
           </div>
           <div class="group">
             <button id="undo" class="tool draw-only" title="Deshacer" aria-label="Deshacer"><svg><use href="#i-undo"/></svg></button>

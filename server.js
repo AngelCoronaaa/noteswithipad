@@ -36,6 +36,8 @@ await pool.query(`
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
   );
+  ALTER TABLE notes ADD COLUMN IF NOT EXISTS kind  text NOT NULL DEFAULT 'note';
+  ALTER TABLE notes ADD COLUMN IF NOT EXISTS paper text NOT NULL DEFAULT 'blank';
   CREATE INDEX IF NOT EXISTS notes_user_updated_idx ON notes (user_id, pinned DESC, updated_at DESC);
   DELETE FROM sessions WHERE expires_at < now();
 `);
@@ -119,7 +121,10 @@ async function requireUser(req, res, next) {
 
 const isUuid = (s) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 
-const LIST_COLUMNS = `id, title, left(body, 140) AS preview, pinned, updated_at,
+const KINDS = ['note', 'canvas'];
+const PAPERS = ['blank', 'grid', 'lined', 'dots'];
+
+const LIST_COLUMNS = `id, title, kind, left(body, 140) AS preview, pinned, updated_at,
   (drawing IS NOT NULL AND jsonb_array_length(coalesce(drawing->'strokes', '[]'::jsonb)) > 0) AS has_drawing`;
 
 // ---------- app ----------
@@ -230,9 +235,11 @@ app.get('/api/notes', requireUser, async (req, res, next) => {
 
 app.post('/api/notes', requireUser, async (req, res, next) => {
   try {
+    const kind = KINDS.includes(req.body?.kind) ? req.body.kind : 'note';
+    const paper = PAPERS.includes(req.body?.paper) ? req.body.paper : 'blank';
     const { rows } = await pool.query(
-      `INSERT INTO notes (user_id) VALUES ($1) RETURNING ${LIST_COLUMNS}`,
-      [req.user.id]
+      `INSERT INTO notes (user_id, kind, paper) VALUES ($1, $2, $3) RETURNING ${LIST_COLUMNS}`,
+      [req.user.id, kind, paper]
     );
     res.status(201).json(rows[0]);
   } catch (err) {
@@ -244,7 +251,7 @@ app.get('/api/notes/:id', requireUser, async (req, res, next) => {
   try {
     if (!isUuid(req.params.id)) return res.status(404).json({ error: 'No encontrada' });
     const { rows } = await pool.query(
-      `SELECT id, title, body, drawing, pinned, updated_at FROM notes WHERE id = $1 AND user_id = $2`,
+      `SELECT id, title, kind, paper, body, drawing, pinned, updated_at FROM notes WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.user.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'No encontrada' });
@@ -268,6 +275,10 @@ app.put('/api/notes/:id', requireUser, async (req, res, next) => {
     if ('title' in b) add('title', String(b.title).slice(0, 300));
     if ('body' in b) add('body', String(b.body).slice(0, 500_000));
     if ('pinned' in b) add('pinned', Boolean(b.pinned));
+    if ('paper' in b) {
+      if (!PAPERS.includes(b.paper)) return res.status(400).json({ error: 'Papel inválido' });
+      add('paper', b.paper);
+    }
     if ('drawing' in b) {
       if (b.drawing !== null && (typeof b.drawing !== 'object' || !Array.isArray(b.drawing.strokes))) {
         return res.status(400).json({ error: 'Dibujo inválido' });
