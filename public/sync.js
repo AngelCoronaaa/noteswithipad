@@ -6,7 +6,7 @@
 //    la versión del servidor en la nota original y la versión local como una copia nueva "(conflicto)".
 //    Así nunca se pierde texto ni dibujos.
 
-import { ALL_FIELDS, fromServer } from './store.js?v=__V__';
+import { ALL_FIELDS, fromServer, drawingJson } from './store.js?v=__V__';
 
 const MAX_LIST = 500;   // el servidor devuelve como máximo 500 notas: con ese tope no se puede saber qué se borró
 const MAX_FILES = 2000;
@@ -101,18 +101,20 @@ export function createSync({ store, api, upload, download, uuid, hooks }) {
   }
 
   async function pushOne(id, retried) {
-    const note = await store.get(id);
+    const note = await store.getMeta(id);
     if (!note || (!note.isNew && !note.dirty.length)) return;
 
+    // El cuerpo se arma como texto: el dibujo ya está guardado como JSON por trazo (no se vuelve a convertir).
     const fields = note.isNew ? ALL_FIELDS : note.dirty.filter((f) => ALL_FIELDS.includes(f));
-    const payload = {};
-    for (const f of fields) payload[f] = note[f];
-    if (note.isNew) payload.create = { kind: note.kind, paper: note.paper };
-    else payload.base = note.updated_at;
+    const parts = [];
+    for (const f of fields) {
+      parts.push(f === 'drawing' ? `"drawing":${drawingJson(await store.getDrawingRec(id))}` : `${JSON.stringify(f)}:${JSON.stringify(note[f])}`);
+    }
+    parts.push(note.isNew ? `"create":${JSON.stringify({ kind: note.kind, paper: note.paper })}` : `"base":${JSON.stringify(note.updated_at)}`);
 
     let saved;
     try {
-      saved = await q('PUT', `/api/notes/${id}`, payload);
+      saved = await q('PUT', `/api/notes/${id}`, `{${parts.join(',')}}`);
     } catch (err) {
       if (err.status === 409 && err.data?.server) return resolveConflict(note, err.data.server);
       if (err.status === 404 && !note.isNew && !retried) {
@@ -129,7 +131,7 @@ export function createSync({ store, api, upload, download, uuid, hooks }) {
       throw err;
     }
 
-    const cur = await store.get(id);
+    const cur = await store.getMeta(id);
     if (!cur) {
       // Se eliminó aquí mientras se enviaba: ya existe en el servidor, así que se encola su borrado.
       await store.markDeleted(id);
@@ -139,9 +141,10 @@ export function createSync({ store, api, upload, download, uuid, hooks }) {
     cur.updated_at = saved.updated_at;
     cur.isNew = false;
     // Lo que se editó mientras se enviaba sigue pendiente; lo demás queda sincronizado.
-    const unchanged = (f) => cur.rev === note.rev || JSON.stringify(cur[f]) === JSON.stringify(note[f]);
+    // (el dibujo solo se da por enviado si no hubo cambios locales desde que se leyó)
+    const unchanged = (f) => cur.rev === note.rev || (f !== 'drawing' && JSON.stringify(cur[f]) === JSON.stringify(note[f]));
     cur.dirty = cur.dirty.filter((f) => !(fields.includes(f) && unchanged(f)));
-    await store.put(cur);
+    await store.put(cur); // solo datos: el dibujo no se toca
   }
 
   async function pushFile(f) {
@@ -194,7 +197,8 @@ export function createSync({ store, api, upload, download, uuid, hooks }) {
     });
   }
 
-  async function resolveConflict(local, server) {
+  async function resolveConflict(meta, server) {
+    const local = (await store.get(meta.id)) ?? meta; // con el dibujo, para la copia
     const title = local.title.trim() || 'Sin título';
     await store.put({
       ...local,
@@ -230,7 +234,7 @@ export function createSync({ store, api, upload, download, uuid, hooks }) {
     await pool(todo, 4, async (s) => {
       if (hooks.isEditing(s.id)) return; // se está editando ahora: se baja en la próxima sincronización
       const full = await q('GET', `/api/notes/${s.id}`);
-      const prev = await store.get(s.id);
+      const prev = await store.getMeta(s.id);
       if (prev && (prev.isNew || prev.dirty.length)) return; // se editó aquí mientras tanto: gana lo local
       if (hooks.isEditing(s.id)) return;
       await store.put(fromServer(full, prev?.rev ?? 0));
@@ -242,7 +246,7 @@ export function createSync({ store, api, upload, download, uuid, hooks }) {
         if (l.isNew || serverIds.has(l.id)) continue;
         if (l.pending) {
           // Se borró en otro dispositivo pero aquí tiene cambios sin enviar: se conserva y se vuelve a subir.
-          const n = await store.get(l.id);
+          const n = await store.getMeta(l.id);
           if (n) await store.put({ ...n, isNew: true, dirty: [...ALL_FIELDS], updated_at: null, rev: n.rev + 1 });
           again = true;
         } else {

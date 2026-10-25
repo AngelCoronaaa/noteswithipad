@@ -14,7 +14,7 @@ async function api(method, url, body, { quiet = false } = {}) {
   const res = await fetch(url, {
     method,
     headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    body: body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body), // texto = JSON ya armado
     credentials: 'same-origin',
   });
   if (res.status === 401 && !url.startsWith('/api/auth')) {
@@ -737,6 +737,7 @@ async function openNote(id, { focusTitle = false, keepView = false, from = null 
   const apply = () => {
     state.current = { id: note.id, title: note.title, body: note.body, pinned: note.pinned, kind: note.kind, paper: note.paper };
     state.items = Array.isArray(note.drawing?.strokes) ? note.drawing.strokes : [];
+    note.drawingParts?.forEach((part, i) => { if (state.items[i]) itemJson.set(state.items[i], part); });
     state.undo = [];
     state.redo = [];
     state.sel = null;
@@ -837,7 +838,7 @@ async function updateNote(id, patch) {
     if ('pinned' in patch) els.pin.setAttribute('aria-pressed', String(patch.pinned));
     return flush();
   }
-  const n = await store.get(id);
+  const n = await store.getMeta(id);
   if (!n) return;
   Object.assign(n, patch);
   n.dirty = [...new Set([...n.dirty, ...Object.keys(patch)])];
@@ -849,7 +850,7 @@ async function updateNote(id, patch) {
 }
 
 async function togglePin(id) {
-  const n = await store.get(id);
+  const n = await store.getMeta(id);
   if (n) await updateNote(id, { pinned: !n.pinned });
 }
 
@@ -866,7 +867,7 @@ async function duplicateNote(id) {
 }
 
 async function deleteNote(id) {
-  const note = await store.get(id);
+  const note = await store.getMeta(id);
   if (!note || !confirm(`¿Eliminar ${note.kind === 'canvas' ? 'este lienzo' : 'esta nota'}?`)) return;
   const open = state.current?.id === id;
   if (open) {
@@ -1360,10 +1361,22 @@ function scheduleFlush(ms) {
   }, ms);
 }
 
-function drawingPayload() {
+// JSON de cada objeto del dibujo, calculado una sola vez (los objetos no se modifican, se reemplazan).
+// Guardar = unir textos ya hechos: no se recorre ni se copia el dibujo entero mientras se escribe.
+const itemJson = new WeakMap();
+function jsonOf(it) {
+  let s = itemJson.get(it);
+  if (s === undefined) {
+    s = JSON.stringify(it);
+    itemJson.set(it, s);
+  }
+  return s;
+}
+
+function drawingRecord() {
   if (!state.items.length) return null;
-  const h = els.sheet.offsetHeight / els.sheet.offsetWidth;
-  return { v: 2, h: Math.round(h * 1000) / 1000, strokes: state.items };
+  const h = Math.round((els.sheet.offsetHeight / els.sheet.offsetWidth) * 1000) / 1000;
+  return { v: 2, h, parts: state.items.map(jsonOf) };
 }
 
 function flush() {
@@ -1376,9 +1389,10 @@ function flush() {
     const fields = [...dirty];
     dirty.clear();
     try {
-      const note = await store.get(id);
+      const note = await store.getMeta(id); // solo datos (sin el dibujo)
       if (!note) return; // se eliminó
-      for (const f of fields) note[f] = f === 'drawing' ? drawingPayload() : state.current[f];
+      for (const f of fields) if (f !== 'drawing') note[f] = state.current[f];
+      if (fields.includes('drawing')) note.drawingRec = drawingRecord();
       note.dirty = [...new Set([...note.dirty, ...fields])];
       note.rev += 1;
       if (fields.some((f) => f !== 'pinned')) note.localAt = Date.now();

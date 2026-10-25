@@ -1,7 +1,7 @@
 // Almacén local (IndexedDB) de notas y cola de cambios pendientes. Una base de datos por usuario.
 //
 // Registro de nota (store "notes"):
-//   { id, kind, paper, title, body, drawing, pinned,
+//   { id, kind, paper, title, body, pinned, hasDrawing,
 //     updated_at,  // última versión conocida del servidor (null si aún no existe allí)
 //     isNew,       // creada sin conexión y todavía no enviada
 //     dirty,       // campos cambiados aquí y todavía no enviados
@@ -10,6 +10,13 @@
 //     syncError }  // motivo por el que el servidor rechazó la nota (se limpia al editarla)
 //
 // Para que la lista no tenga que leer todos los dibujos, cada nota tiene un resumen ligero en el store "items".
+//
+// El dibujo va aparte (store "drawings"): { id, v, h, parts }, donde `parts` es cada objeto ya convertido a JSON.
+// Así guardar mientras se escribe es barato (no se recorre ni se copia el dibujo como objeto): se guardan
+// textos ya preparados, y el JSON para el servidor se arma uniéndolos.
+//   get(id)      → nota + `drawing` (objeto) + `drawingParts`
+//   getMeta(id)  → solo los datos de la nota (sin dibujo)
+//   put(note)    → con `drawing` (objeto o null) o `drawingRec` ({ v, h, parts } o null); sin ninguno, no toca el dibujo
 //
 // Archivo (store "files"): { id, name, type, size, embedded, created_at, hasBlob, isNew, localAt, syncError }
 //   embedded: imagen insertada en un lienzo (no aparece en la lista de archivos)
@@ -29,7 +36,7 @@ export function toItem(n) {
     rev: n.rev,
     preview: n.body.slice(0, 280),
     pinned: n.pinned,
-    has_drawing: Boolean(n.drawing?.strokes?.length),
+    has_drawing: Boolean(n.hasDrawing),
     isNew: n.isNew,
     pending,
     syncError: n.syncError || null,
@@ -54,6 +61,30 @@ export function fromServer(s, prevRev = 0) {
   };
 }
 
+// Dibujo (objeto) ⇄ registro guardado
+export function toDrawingRec(drawing) {
+  if (!drawing || !Array.isArray(drawing.strokes) || !drawing.strokes.length) return null;
+  return { v: drawing.v ?? 2, h: drawing.h ?? null, parts: drawing.strokes.map((it) => JSON.stringify(it)) };
+}
+export function drawingFromRec(rec) {
+  return rec?.parts?.length ? { v: rec.v, h: rec.h, strokes: rec.parts.map((x) => JSON.parse(x)) } : null;
+}
+// JSON del dibujo para enviarlo, sin volver a convertir cada trazo
+export function drawingJson(rec) {
+  if (!rec?.parts?.length) return 'null';
+  return `{"v":${JSON.stringify(rec.v ?? 2)},"h":${JSON.stringify(rec.h ?? null)},"strokes":[${rec.parts.join(',')}]}`;
+}
+
+// Separa la nota en datos + registro de dibujo (undefined = no se toca el dibujo)
+function splitNote(note) {
+  const { drawing, drawingRec, drawingParts, ...meta } = note;
+  let rec;
+  if (drawingRec !== undefined) rec = drawingRec;
+  else if (drawing !== undefined) rec = toDrawingRec(drawing);
+  if (rec !== undefined) meta.hasDrawing = Boolean(rec?.parts?.length);
+  return { meta, rec };
+}
+
 const req = (r) => new Promise((resolve, reject) => {
   r.onsuccess = () => resolve(r.result);
   r.onerror = () => reject(r.error);
@@ -69,9 +100,10 @@ export async function openStore(userId) {
   const name = `notas-${userId}`;
   try {
     const db = await new Promise((resolve, reject) => {
-      const r = indexedDB.open(name, 2);
+      const r = indexedDB.open(name, 3);
       r.onupgradeneeded = (ev) => {
         const d = r.result;
+        const tx = r.transaction;
         if (ev.oldVersion < 1) {
           d.createObjectStore('notes', { keyPath: 'id' });
           d.createObjectStore('items', { keyPath: 'id' });
@@ -80,6 +112,25 @@ export async function openStore(userId) {
         if (ev.oldVersion < 2) {
           d.createObjectStore('files', { keyPath: 'id' });
           d.createObjectStore('blobs', { keyPath: 'id' });
+        }
+        if (ev.oldVersion < 3) {
+          // El dibujo pasa a su propio store (las notas guardadas antes lo tenían dentro).
+          const drawings = d.createObjectStore('drawings', { keyPath: 'id' });
+          const items = tx.objectStore('items');
+          tx.objectStore('notes').openCursor().onsuccess = (e) => {
+            const c = e.target.result;
+            if (!c) return;
+            const n = c.value;
+            if ('drawing' in n) {
+              const rec = toDrawingRec(n.drawing);
+              if (rec) drawings.put({ id: n.id, ...rec });
+              delete n.drawing;
+              n.hasDrawing = Boolean(rec);
+              c.update(n);
+              items.put(toItem(n));
+            }
+            c.continue();
+          };
         }
       };
       r.onsuccess = () => resolve(r.result);
@@ -96,17 +147,28 @@ function idbStore(db, name) {
   return {
     persistent: true,
     items: () => req(os('items').getAll()),
-    get: (id) => req(os('notes').get(id)),
+    getMeta: (id) => req(os('notes').get(id)),
+    getDrawingRec: async (id) => (await req(os('drawings').get(id))) ?? null,
+    async get(id) {
+      const tx = db.transaction(['notes', 'drawings']);
+      const [meta, rec] = await Promise.all([req(tx.objectStore('notes').get(id)), req(tx.objectStore('drawings').get(id))]);
+      if (!meta) return undefined;
+      return { ...meta, drawing: drawingFromRec(rec), drawingParts: rec?.parts ?? null };
+    },
     async put(note) {
-      const tx = db.transaction(['notes', 'items'], 'readwrite');
-      tx.objectStore('notes').put(note);
-      tx.objectStore('items').put(toItem(note));
+      const { meta, rec } = splitNote(note);
+      const tx = db.transaction(['notes', 'items', 'drawings'], 'readwrite');
+      tx.objectStore('notes').put(meta);
+      tx.objectStore('items').put(toItem(meta));
+      if (rec) tx.objectStore('drawings').put({ id: meta.id, v: rec.v, h: rec.h, parts: rec.parts });
+      else if (rec === null) tx.objectStore('drawings').delete(meta.id);
       await done(tx);
     },
     async remove(id) {
-      const tx = db.transaction(['notes', 'items'], 'readwrite');
+      const tx = db.transaction(['notes', 'items', 'drawings'], 'readwrite');
       tx.objectStore('notes').delete(id);
       tx.objectStore('items').delete(id);
+      tx.objectStore('drawings').delete(id);
       await done(tx);
     },
     files: () => req(os('files').getAll()),
@@ -146,16 +208,25 @@ function idbStore(db, name) {
 }
 
 function memoryStore() {
-  const notes = new Map(), items = new Map(), files = new Map(), deleted = new Map();
+  const notes = new Map(), items = new Map(), drawings = new Map(), files = new Map(), deleted = new Map();
   return {
     persistent: false,
     items: async () => [...items.values()],
-    get: async (id) => (notes.has(id) ? structuredClone(notes.get(id)) : undefined),
-    async put(note) {
-      notes.set(note.id, structuredClone(note));
-      items.set(note.id, toItem(note));
+    getMeta: async (id) => (notes.has(id) ? { ...notes.get(id), dirty: [...notes.get(id).dirty] } : undefined),
+    getDrawingRec: async (id) => drawings.get(id) ?? null,
+    async get(id) {
+      if (!notes.has(id)) return undefined;
+      const rec = drawings.get(id);
+      return { ...notes.get(id), dirty: [...notes.get(id).dirty], drawing: drawingFromRec(rec), drawingParts: rec?.parts ?? null };
     },
-    async remove(id) { notes.delete(id); items.delete(id); },
+    async put(note) {
+      const { meta, rec } = splitNote(note);
+      notes.set(meta.id, { ...meta, dirty: [...meta.dirty] });
+      items.set(meta.id, toItem(meta));
+      if (rec) drawings.set(meta.id, { v: rec.v, h: rec.h, parts: [...rec.parts] });
+      else if (rec === null) drawings.delete(meta.id);
+    },
+    async remove(id) { notes.delete(id); items.delete(id); drawings.delete(id); },
     files: async () => [...files.values()].map(({ blob, ...meta }) => meta),
     getFile: async (id) => (files.has(id) ? { ...files.get(id) } : undefined),
     async putFile(f) {
@@ -167,7 +238,7 @@ function memoryStore() {
     markDeleted: async (id, kind = 'note') => { deleted.set(id, kind); },
     unmarkDeleted: async (id) => { deleted.delete(id); },
     deleted: async () => [...deleted].map(([id, kind]) => ({ id, kind })),
-    async destroy() { notes.clear(); items.clear(); files.clear(); deleted.clear(); },
+    async destroy() { notes.clear(); items.clear(); drawings.clear(); files.clear(); deleted.clear(); },
   };
 }
 
