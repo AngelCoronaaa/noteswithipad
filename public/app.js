@@ -267,7 +267,7 @@ async function startApp(user) {
 }
 
 const syncHooks = {
-  isBusy: () => isWriting(),
+  isBusy: () => els.app.dataset.view === 'note' && isWriting(), // solo con el editor abierto
   onState(s, pending) {
     netState = { s, pending };
     renderNet();
@@ -1324,42 +1324,42 @@ function setStatus(text, isError = false) {
 // Estado de la nota abierta: guardada, pendiente (sin conexión) o sincronizando.
 function updateStatus() {
   if (!state.current) return;
-  if (dirty.size) return setStatus('Guardando…');
+  if (dirty.size) return setStatus('Sin guardar');
   const item = state.notes.find((n) => n.id === state.current.id);
   if (item?.syncError) return setStatus('No se pudo sincronizar', true);
   if (!state.pendingIds.has(state.current.id)) return setStatus(store && !store.persistent ? 'Guardado' : 'Guardado');
-  if (netState.s === 'offline' || netState.s === 'error') return setStatus('Guardado en este dispositivo · se sincronizará');
   if (netState.s === 'auth') return setStatus('Guardado en este dispositivo · inicia sesión para sincronizar');
-  setStatus('Guardado · sincronizando…');
+  setStatus('Guardado en este dispositivo · se sincronizará');
 }
 
-// Escribiendo con el Pencil (o justo después): se evita cualquier trabajo pesado (guardar, sincronizar,
-// miniaturas) porque bloquearía el hilo principal y Safari podría cortar el trazo siguiente.
-const WRITE_PAUSE_MS = 1500;
-const FORCE_SAVE_MS = 20000;
-let firstDirtyAt = 0;
+// MIENTRAS SE ESCRIBE NO SE GUARDA NADA (ni se sincroniza): cualquier trabajo pesado podría cortar el trazo.
+// Se guarda solo:
+//   · al salir de la nota o abrir otra, al cambiar de app o cerrar (flush directo),
+//   · tras IDLE_SAVE_MS sin tocar la hoja (ni lápiz cerca, ni dedo, ni teclado),
+//   · o al tocar "Sin guardar" en la barra superior.
+const IDLE_SAVE_MS = 10000;
 let lastStrokeAt = -Infinity;
-const isWriting = () => active !== null || penDown || performance.now() - Math.max(lastPenAt, lastStrokeAt) < WRITE_PAUSE_MS;
+const isWriting = () =>
+  active !== null || penDown || performance.now() - Math.max(lastPenAt, lastStrokeAt, lastEditAt) < IDLE_SAVE_MS;
 
 function markDirty(field) {
-  if (!dirty.size) firstDirtyAt = performance.now();
   dirty.add(field);
   lastEditAt = performance.now();
-  setStatus('Guardando…');
-  // Cada cambio pospone el guardado, salvo que ya lleve 20 s pendiente: entonces el temporizador sigue su curso.
-  if (!saveTimer || performance.now() - firstDirtyAt < FORCE_SAVE_MS) scheduleFlush(600);
+  setStatus('Sin guardar');
+  if (!saveTimer) scheduleFlush(IDLE_SAVE_MS);
 }
 
 function scheduleFlush(ms) {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    // Si se sigue escribiendo, se espera a una pausa; tras 20 s se guarda igual, pero nunca con el lápiz apoyado.
-    const overdue = performance.now() - firstDirtyAt > FORCE_SAVE_MS;
-    if (isWriting() && !(overdue && active === null && !penDown)) return scheduleFlush(400);
+    if (isWriting()) return scheduleFlush(1000); // se sigue usando la hoja: se espera
     flush().catch(() => {});
   }, ms);
 }
+
+// Tocar "Sin guardar" guarda en ese momento.
+els.status.addEventListener('click', () => { if (dirty.size) flush().catch(() => {}); });
 
 // JSON de cada objeto del dibujo, calculado una sola vez (los objetos no se modifican, se reemplazan).
 // Guardar = unir textos ya hechos: no se recorre ni se copia el dibujo entero mientras se escribe.
@@ -1406,6 +1406,7 @@ function flush() {
     state.pendingIds.add(id);
     updateStatus();
     if (els.app.dataset.view === 'hub') await loadNotes();
+    sync.refreshCount();
     sync.schedule({ ms: 1200 });
   });
   saving = run.catch(() => {}); // un fallo no debe bloquear los guardados siguientes
@@ -1413,7 +1414,7 @@ function flush() {
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') flush().catch(() => {});
+  if (document.visibilityState === 'hidden') flush().then(() => sync?.run({ force: true })).catch(() => {});
 });
 addEventListener('pagehide', () => flush().catch(() => {}));
 

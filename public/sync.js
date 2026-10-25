@@ -44,10 +44,11 @@ export function createSync({ store, api, upload, download, uuid, hooks }) {
     timer = setTimeout(run, ms);
   }
 
-  async function run() {
+  // force: sincronizar ya aunque se esté escribiendo (cerrar sesión, la app pasa a segundo plano)
+  async function run({ force = false } = {}) {
     if (stopped) return;
     if (running) { again = true; return; }
-    if (hooks.isBusy?.()) {
+    if (!force && hooks.isBusy?.()) {
       // Se está escribiendo: se espera a una pausa para no bloquear el trazo.
       clearTimeout(timer);
       timer = setTimeout(run, 1000);
@@ -261,7 +262,7 @@ export function createSync({ store, api, upload, download, uuid, hooks }) {
   async function flushNow() {
     for (let i = 0; i < 3; i++) {
       while (running) await new Promise((r) => setTimeout(r, 100));
-      await run();
+      await run({ force: true });
       if (!(await pendingCount())) break;
     }
   }
@@ -271,6 +272,7 @@ export function createSync({ store, api, upload, download, uuid, hooks }) {
     run,
     flushNow,
     pendingCount,
+    refreshCount: async () => { if (!stopped) hooks.onState(state, await pendingCount()); },
     getState: () => state,
     stop() {
       stopped = true;
