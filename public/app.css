@@ -156,6 +156,9 @@ input, textarea { background: transparent; border: 0; outline: 0; }
 .app { height: 100%; position: relative; }
 .view { position: absolute; inset: 0; padding: calc(14px + var(--sat-top)) 14px calc(14px + var(--sat-bottom)); }
 
+/* Sin zoom por doble toque (quita la espera de Safari para distinguir toques dobles, también con el Pencil). */
+.hub, .scroller, .file-body, .toolbar, .pop, .note-bar { touch-action: manipulation; }
+
 /* No seleccionar texto de la interfaz por accidente (palma, toques largos); los campos sí. */
 .app { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 .app input, .app textarea, .file-body pre { -webkit-user-select: text; user-select: text; -webkit-touch-callout: default; }

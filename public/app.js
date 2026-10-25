@@ -212,6 +212,7 @@ async function logout() {
     }
   }
   try { localStorage.removeItem('lastUser'); } catch {}
+  try { Object.keys(localStorage).filter((k) => k.startsWith(backupPrefix())).forEach((k) => localStorage.removeItem(k)); } catch {}
   await teardown({ wipe: true }); // se borran las copias locales de este dispositivo
   showAuth();
 }
@@ -256,6 +257,7 @@ async function startApp(user) {
   try { localStorage.setItem('lastUser', JSON.stringify(user)); } catch {}
   await teardown();
   store = await openStore(user.id);
+  await restoreBackups(); // cambios que no llegaron a guardarse la última vez
   sync = createSync({ store, api, upload: uploadFile, download: downloadFile, uuid, hooks: syncHooks });
   els.auth.hidden = true;
   els.app.hidden = false;
@@ -1403,6 +1405,7 @@ function flush() {
       setStatus(err?.name === 'QuotaExceededError' ? 'No hay espacio para guardar en este dispositivo' : 'No se pudo guardar en el dispositivo', true);
       throw err;
     }
+    clearBackup(id);
     state.pendingIds.add(id);
     updateStatus();
     if (els.app.dataset.view === 'hub') await loadNotes();
@@ -1414,9 +1417,56 @@ function flush() {
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') flush().then(() => sync?.run({ force: true })).catch(() => {});
+  if (document.visibilityState === 'hidden') {
+    writeBackup(); // inmediata: por si iOS cierra la app antes de terminar el guardado normal
+    flush().then(() => sync?.run({ force: true })).catch(() => {});
+  }
 });
-addEventListener('pagehide', () => flush().catch(() => {}));
+addEventListener('pagehide', () => {
+  writeBackup();
+  flush().catch(() => {});
+});
+
+// ---------- Copia de emergencia ----------
+// Mientras se escribe no se guarda. Si la página se cierra o recarga justo después, el guardado normal (asíncrono)
+// puede no terminar a tiempo; por eso, al ocultarse o cerrarse, los cambios pendientes se copian de forma
+// síncrona en localStorage y se recuperan al volver a abrir la app.
+const backupPrefix = () => `unsaved:${currentUser?.id}:`;
+
+function writeBackup() {
+  if (!state.current || !dirty.size || !currentUser) return;
+  const c = state.current;
+  const meta = JSON.stringify({ t: Date.now(), fields: [...dirty], title: c.title, body: c.body, paper: c.paper, pinned: c.pinned });
+  const rec = dirty.has('drawing') ? drawingRecord() : null;
+  // El dibujo se añade como JSON ya hecho (unir textos: instantáneo)
+  const drawing = dirty.has('drawing') ? (rec ? `{"v":2,"h":${rec.h},"strokes":[${rec.parts.join(',')}]}` : 'null') : 'null';
+  try { localStorage.setItem(backupPrefix() + c.id, `{"meta":${meta},"drawing":${drawing}}`); } catch {} // si no cabe, queda el guardado normal
+}
+
+function clearBackup(id) {
+  try { localStorage.removeItem(backupPrefix() + id); } catch {}
+}
+
+async function restoreBackups() {
+  let keys = [];
+  try { keys = Object.keys(localStorage).filter((k) => k.startsWith(backupPrefix())); } catch { return; }
+  for (const key of keys) {
+    try {
+      const { meta: b, drawing } = JSON.parse(localStorage.getItem(key));
+      const note = await store.getMeta(key.slice(backupPrefix().length));
+      if (note && b.t > (note.localAt || 0)) { // solo si es más reciente que lo guardado
+        for (const f of b.fields) if (f !== 'drawing') note[f] = b[f];
+        if (b.fields.includes('drawing')) note.drawing = drawing;
+        note.dirty = [...new Set([...note.dirty, ...b.fields])];
+        note.rev += 1;
+        note.localAt = b.t;
+        note.syncError = null;
+        await store.put(note);
+      }
+    } catch {}
+    try { localStorage.removeItem(key); } catch {}
+  }
+}
 
 // ---------- Herramientas y paneles ----------
 
@@ -2256,6 +2306,17 @@ function onCanvasDown(e) {
 }
 els.canvas.addEventListener('pointerdown', onCanvasDown);
 
+// iPadOS: si la página no "reclama" el toque al empezar, Safari puede dárselo a sus propios gestos —Scribble
+// (escritura a texto), doble toque, lupa de selección, desplazamiento, gestos del borde— y cancela o se come
+// trazos, sobre todo los cortos y rápidos (puntos, tildes) al escribir deprisa. Anular el comportamiento por
+// defecto de touchstart/touchmove en la hoja lo evita. Los eventos de puntero (con los que se dibuja) no cambian.
+function claimTouch(e) {
+  if (els.app.dataset.view !== 'note' || e.target.closest?.('button')) return; // los botones de la hoja siguen funcionando
+  const stylus = [...e.changedTouches].some((t) => t.touchType === 'stylus');
+  if (stylus || state.tool !== 'text') e.preventDefault(); // en modo texto el dedo sigue escribiendo y desplazando
+}
+for (const type of ['touchstart', 'touchmove']) els.sheet.addEventListener(type, claimTouch, { passive: false });
+
 // En una nota, tocar con el Pencil sobre la hoja pasa a dibujar sin tener que cambiar de herramienta.
 els.sheet.addEventListener('pointerdown', (e) => {
   if (e.pointerType !== 'pen' || state.tool !== 'text' || !state.current || e.target === els.canvas) return;
@@ -2461,6 +2522,13 @@ function eraseAt(e, rect) {
 
 function endAction(e) {
   if (!active || e.pointerId !== active.id) return;
+  if (e.type === 'lostpointercapture') {
+    // El Pencil reutiliza el mismo pointerId en cada trazo: este aviso del trazo ANTERIOR puede llegar cuando el
+    // siguiente ya empezó, y lo cortaría (se perdía casi todo el trazo al escribir rápido). Para lápiz y
+    // borrador se ignora (si faltara el "levantar", el siguiente trazo cierra el anterior); para lo demás, solo
+    // cuenta si de verdad ya no hay captura.
+    if (active.mode === 'pen' || active.mode === 'eraser' || els.canvas.hasPointerCapture?.(e.pointerId)) return;
+  }
   finishAction(e.type === 'pointercancel');
 }
 
