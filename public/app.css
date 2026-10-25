@@ -365,17 +365,26 @@ input, textarea { background: transparent; border: 0; outline: 0; }
 .sheet[data-paper="grid"] {
   background-image: linear-gradient(var(--paper-line) 1px, transparent 1px), linear-gradient(90deg, var(--paper-line) 1px, transparent 1px);
   background-size: var(--pu) var(--pu);
+  background-position: var(--bx, 0px) var(--by, 0px);
 }
 .sheet[data-paper="lined"] {
   background-image: linear-gradient(to bottom, transparent calc(100% - 1px), var(--paper-line) 100%);
   background-size: 100% calc(var(--pu) * 1.35);
-  background-position: 0 calc(var(--pu) * 0.6);
+  background-position: 0 calc(var(--pu) * 0.6 + var(--by, 0px));
 }
 .sheet[data-paper="dots"] {
   background-image: radial-gradient(circle, var(--paper-dot) 1.3px, transparent 1.8px);
   background-size: var(--pu) var(--pu);
-  background-position: calc(var(--pu) / 2) calc(var(--pu) / 2);
+  background-position: calc(var(--pu) / 2 + var(--bx, 0px)) calc(var(--pu) / 2 + var(--by, 0px));
 }
+
+/* Lienzos: vista infinita con zoom (el canvas ocupa la vista; el papel se mueve con la cámara vía --pu/--bx/--by) */
+.canvas { transform-origin: 0 0; }
+.note-view[data-kind="canvas"] .scroller { overflow: hidden; padding-bottom: 0; touch-action: none; }
+.note-view[data-kind="canvas"] .sheet-wrap { height: 100%; }
+.note-view[data-kind="canvas"] .sheet { min-height: 0; height: 100%; overflow: hidden; }
+.note-view[data-kind="canvas"] #more-page { display: none; }
+.zoom-btn { height: 30px; min-width: 64px; padding: 0 12px; border: 1px solid var(--glass-border); font-size: 12.5px; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; }
 
 .note-view[data-kind="canvas"] .sheet .title,
 .note-view[data-kind="canvas"] .sheet .body,

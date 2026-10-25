@@ -88,7 +88,7 @@ const state = {
   items: [],            // trazos, formas y stickers
   undo: [],
   redo: [],
-  sel: null,            // índice del objeto seleccionado
+  sel: [],              // índices de los objetos seleccionados
   tool: 'text',         // text | pen | eraser | shape | sticker | select
   pen: 'ballpoint',
   color: 'ink',
@@ -97,6 +97,7 @@ const state = {
   shapeFill: false,
   sticker: '⭐',
   snapShapes: true,     // formas perfectas al mantener el lápiz quieto
+  stabilizer: 0.3,      // estabilizador de trazo (0 = apagado, 1 = máximo)
   fingerDraws: false,
   query: '',
   filter: 'all',        // all | note | canvas | file
@@ -115,11 +116,11 @@ try {
 if (!PENS[state.pen]) state.pen = 'ballpoint';
 if (!SHAPES[state.shape]) state.shape = 'rect';
 state.tool = 'text';
-state.sel = null;
+state.sel = [];
 
 function savePrefs() {
-  const { pen, color, mult, shape, shapeFill, sticker, snapShapes } = state;
-  try { localStorage.setItem('prefs', JSON.stringify({ pen, color, mult, shape, shapeFill, sticker, snapShapes })); } catch {}
+  const { pen, color, mult, shape, shapeFill, sticker, snapShapes, stabilizer } = state;
+  try { localStorage.setItem('prefs', JSON.stringify({ pen, color, mult, shape, shapeFill, sticker, snapShapes, stabilizer })); } catch {}
 }
 
 const els = {
@@ -132,7 +133,7 @@ const els = {
   pin: $('#pin'), deleteBtn: $('#delete'), exportBtn: $('#export-btn'), undo: $('#undo'), redo: $('#redo'), finger: $('#finger'),
   pop: $('#pop'), selUi: $('#sel-ui'), paperPicker: $('#paper-picker'), colorBtn: $('#color-btn'), insertImage: $('#insert-image'),
   fileView: $('#file-view'), fileBody: $('#file-body'), fileName: $('#file-name'), fileBack: $('#file-back'),
-  fileSave: $('#file-save'), fileDelete: $('#file-delete'), fileAnnotate: $('#file-annotate'),
+  fileSave: $('#file-save'), fileDelete: $('#file-delete'), fileAnnotate: $('#file-annotate'), zoomBtn: $('#zoom-btn'),
 };
 const ctx = els.canvas.getContext('2d');
 const lctx = els.live.getContext('2d');
@@ -577,7 +578,17 @@ function thumbFor(e) {
     if (again?.key === key) return again.url;
     const note = await store?.get(e.id);
     if (!note?.drawing?.strokes?.length) return null;
-    const c = await renderDrawing(note.drawing.strokes, { width: 360, height: 270 });
+    const strokes = note.drawing.strokes;
+    let view = null;
+    if (note.kind === 'canvas') {
+      const b = unionBounds(strokes);
+      if (b.x0 < -0.02 || b.y0 < -0.02 || b.x1 > 1.02 || b.y1 > 0.77) {
+        const m = 0.06 * Math.max(b.x1 - b.x0, b.y1 - b.y0, 0.05);
+        const sc = Math.min(360 / (b.x1 - b.x0 + 2 * m), 270 / (b.y1 - b.y0 + 2 * m));
+        view = { s: sc, x: (b.x0 + b.x1) / 2 - 180 / sc, y: (b.y0 + b.y1) / 2 - 135 / sc };
+      }
+    }
+    const c = await renderDrawing(strokes, { width: 360, height: 270, view });
     const url = c.toDataURL('image/png');
     thumbCache.set(e.id, { key, url });
     return url;
@@ -742,10 +753,11 @@ async function openNote(id, { focusTitle = false, keepView = false, from = null 
     note.drawingParts?.forEach((part, i) => { if (state.items[i]) itemJson.set(state.items[i], part); });
     state.undo = [];
     state.redo = [];
-    state.sel = null;
+    state.sel = [];
     liveItem = null;
     dirty.clear();
     if (!keepView) closePop();
+    if (note.kind === 'canvas' && !keepView) Object.assign(cam, loadCamera(note.id));
 
     const canvasKind = note.kind === 'canvas';
     els.noteView.dataset.kind = note.kind;
@@ -761,6 +773,9 @@ async function openNote(id, { focusTitle = false, keepView = false, from = null 
     updateStatus();
 
     setView('note');
+    els.zoomBtn.hidden = !canvasKind;
+    if (canvasKind && !keepView) baseUnit = els.scroller.clientWidth || 800; // 100 % = ancho de la vista
+    updateZoomLabel();
     els.scroller.scrollTop = keepView ? scrollTop : 0;
     autoGrow();
     if (!keepView) {
@@ -1038,13 +1053,21 @@ async function insertImage(file) {
   if (!state.current) return;
   try {
     const { id, ratio } = await embedImage(file, file.name);
-    const w = Math.min(0.6, 0.8 / ratio);
-    const h = w * ratio;
-    const y = els.scroller.scrollTop / els.sheet.offsetWidth + 0.06;
-    const item = { t: 'image', f: id, x: round4((1 - w) / 2), y: round4(y), w: round4(w), h: round4(h) };
+    let w, x, y;
+    if (infinite()) {
+      const k = unitPx(), vw = els.canvas.clientWidth / k, vh = els.canvas.clientHeight / k;
+      w = Math.min(0.6 * vw, (0.7 * vh) / ratio);
+      x = cam.x + (vw - w) / 2;
+      y = cam.y + (vh - w * ratio) / 2;
+    } else {
+      w = Math.min(0.6, 0.8 / ratio);
+      x = (1 - w) / 2;
+      y = els.scroller.scrollTop / els.sheet.offsetWidth + 0.06;
+    }
+    const item = { t: 'image', f: id, x: round4(x), y: round4(y), w: round4(w), h: round4(w * ratio) };
     pushUndo();
     state.items = [...state.items, item];
-    state.sel = state.items.length - 1;
+    state.sel = [state.items.length - 1];
     redraw();
     setTool('select');
     commitDrawing();
@@ -1265,11 +1288,13 @@ async function exportNote(id, format) {
     }
     if (format === 'png') {
       const items = note.drawing?.strokes ?? [];
-      const sheetH = note.drawing?.h ?? DEFAULT_SHEET_H[note.kind];
-      const h = Math.min(sheetH, Math.max(0.75, contentBottom(items) + 0.06));
-      const W = Math.round(Math.min(1800, Math.sqrt(14e6 / h))); // sin pasar el límite de canvas de Safari
+      const b = items.length ? unionBounds(items) : { x0: 0, y0: 0, x1: 1, y1: 0.75 };
+      const m = 0.04 * Math.max(b.x1 - b.x0, b.y1 - b.y0, 0.25);
+      const bw = b.x1 - b.x0 + 2 * m, bh = b.y1 - b.y0 + 2 * m;
+      const sc = Math.min(1800 / bw, Math.sqrt(14e6 / (bw * bh))); // sin pasar el límite de canvas de Safari
       const c = await renderDrawing(items, {
-        width: W, height: Math.round(W * h), ink: '#14171f', background: '#ffffff',
+        width: Math.round(bw * sc), height: Math.round(bh * sc), view: { s: sc, x: b.x0 - m, y: b.y0 - m },
+        ink: '#14171f', background: '#ffffff',
         paper: note.kind === 'canvas' ? note.paper : null, paperColor: 'rgba(20, 23, 31, 0.12)',
       });
       const blob = await new Promise((resolve) => c.toBlob(resolve, 'image/png'));
@@ -1483,7 +1508,7 @@ function setTool(tool) {
     document.activeElement?.blur?.();
     getSelection()?.removeAllRanges();
   }
-  if (tool !== 'select') state.sel = null;
+  if (tool !== 'select') state.sel = [];
   if (!['pen', 'shape', 'sticker'].includes(tool) && els.pop.dataset.open !== 'color') closePop();
   renderLive();
 }
@@ -1520,11 +1545,11 @@ function syncColorButton() {
 function setColor(c) {
   state.color = c;
   if (['text', 'eraser'].includes(state.tool)) setTool('pen');
-  if (state.tool === 'select' && state.sel != null) {
-    const it = state.items[state.sel];
-    if (it && it.t !== 'sticker' && it.t !== 'image') {
+  if (state.tool === 'select' && state.sel.length) {
+    const sel = new Set(state.sel.filter((i) => state.items[i] && !['sticker', 'image'].includes(state.items[i].t)));
+    if (sel.size) {
       pushUndo();
-      state.items = state.items.map((x, i) => (i === state.sel ? { ...x, c } : x));
+      state.items = state.items.map((x, i) => (sel.has(i) ? { ...x, c } : x));
       redraw();
       commitDrawing();
     }
@@ -1582,6 +1607,10 @@ function buildPanels() {
     });
     shapeList.append(b);
   }
+  $('#stabilizer').addEventListener('input', (e) => {
+    state.stabilizer = Number(e.target.value);
+    savePrefs();
+  });
   $('#snap-shapes').addEventListener('change', (e) => {
     state.snapShapes = e.target.checked;
     savePrefs();
@@ -1633,6 +1662,7 @@ function syncPanels() {
   $$('.sticker-btn').forEach((b) => b.classList.toggle('on', b.dataset.sticker === state.sticker));
   $('#shape-fill').checked = state.shapeFill;
   $('#snap-shapes').checked = state.snapShapes;
+  $('#stabilizer').value = String(state.stabilizer);
   $('#size').value = $('#size2').value = String(state.mult);
   syncColorButton();
 }
@@ -1649,6 +1679,7 @@ els.finger.setAttribute('aria-pressed', String(state.fingerDraws));
 $('#more-page').addEventListener('click', extendSheet);
 
 function extendSheet() {
+  if (infinite()) return;
   const h = els.sheet.offsetHeight / els.sheet.offsetWidth;
   if (h >= MAX_SHEET_H) return;
   els.sheet.style.setProperty('--sheet-h', String(Math.round((h + 0.8) * 100) / 100));
@@ -1805,17 +1836,170 @@ function mapItem(it, fx, fy, k) {
 
 let inkOverride = null; // color de la tinta "automática" al exportar (siempre oscura sobre blanco)
 const resolveColor = (c) => (c === 'ink' ? inkOverride || getComputedStyle(document.documentElement).getPropertyValue('--ink').trim() || '#000' : c);
-const setNormalized = (c) => c.setTransform(c.canvas.width, 0, 0, c.canvas.width, 0, 0);
+// ---------- Vista: hoja (notas) o lienzo infinito con zoom (lienzos) ----------
+// Coordenadas del mundo: 1 unidad = ancho de la hoja (notas) o ancho de la vista a zoom 100 % (lienzos).
+// Así los lienzos existentes se ven igual: a zoom 100 % y en el origen, 1 unidad = ancho de la pantalla.
+const cam = { x: 0, y: 0, z: 1 }; // lienzos: punto del mundo en la esquina superior izquierda y zoom
+let baseUnit = 800;               // px CSS por unidad a zoom 100 %
+const ZOOM_MIN = 0.1, ZOOM_MAX = 8;
+const ZERO = { x: 0, y: 0 };
+const infinite = () => state.current?.kind === 'canvas';
+const clampZoom = (z) => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z));
+
+// Vista de #canvas y #live: s = px de dispositivo por unidad, (x, y) = origen, k = px CSS por unidad
+let mainView = { s: 1, x: 0, y: 0, k: 1, dpr: 1 };
+function refreshView() {
+  const k = infinite() ? baseUnit * cam.z : els.canvas.clientWidth || 1;
+  const dpr = els.canvas.width / (els.canvas.clientWidth || els.canvas.width || 1);
+  const o = infinite() ? cam : ZERO;
+  mainView = { s: k * dpr, x: o.x, y: o.y, k, dpr };
+}
+const unitPx = () => mainView.k;
+
+// Cada canvas tiene su vista; miniaturas y exportación usan la suya (por defecto: 1 unidad = su ancho)
+const views = new WeakMap();
+const viewOf = (canvas) => (canvas === els.canvas || canvas === els.live ? mainView : views.get(canvas) ?? { s: canvas.width, x: 0, y: 0 });
+const applyView = (c) => {
+  const v = viewOf(c.canvas);
+  c.setTransform(v.s, 0, 0, v.s, -v.x * v.s, -v.y * v.s);
+};
+
+// Esquina de la vista en pantalla (sin la transformación temporal de los gestos)
+function viewRect() {
+  const r = els.sheet.getBoundingClientRect();
+  return { left: r.left + els.sheet.clientLeft, top: r.top + els.sheet.clientTop };
+}
+// Pantalla → mundo
+function worldAt(clientX, clientY) {
+  const r = viewRect();
+  return [mainView.x + (clientX - r.left) / mainView.k, mainView.y + (clientY - r.top) / mainView.k];
+}
+
+// El papel (cuadrícula, rayas, puntos) se mueve y escala con la cámara
+function updatePaper() {
+  if (!infinite()) {
+    for (const p of ['--pu', '--bx', '--by']) els.sheet.style.removeProperty(p);
+    return;
+  }
+  const k = mainView.k;
+  els.sheet.style.setProperty('--pu', `${k / 26}px`);
+  els.sheet.style.setProperty('--bx', `${-cam.x * k}px`);
+  els.sheet.style.setProperty('--by', `${-cam.y * k}px`);
+}
+
+// Cámara: durante un gesto solo se transforma la imagen ya pintada (instantáneo); se repinta de verdad
+// al terminar y, como mucho, cada 250 ms mientras dura.
+let camBase = null, lastCamPaint = 0, camSaveTimer = 0;
+function setCamera(x, y, z) {
+  if (!camBase) camBase = { ...cam };
+  cam.x = x;
+  cam.y = y;
+  cam.z = clampZoom(z);
+  refreshView();
+  updatePaper();
+  updateZoomLabel();
+  const k = mainView.k;
+  const t = `translate(${(camBase.x - cam.x) * k}px, ${(camBase.y - cam.y) * k}px) scale(${cam.z / camBase.z})`;
+  els.canvas.style.transform = els.live.style.transform = t;
+  els.selUi.hidden = true;
+  if (performance.now() - lastCamPaint > 250) paintCamera();
+}
+function paintCamera() {
+  camBase = null;
+  lastCamPaint = performance.now();
+  els.canvas.style.transform = els.live.style.transform = '';
+  redraw();
+  renderLive();
+  clearTimeout(camSaveTimer);
+  camSaveTimer = setTimeout(saveCamera, 400);
+}
+// Zoom alrededor de un punto de la vista (px CSS)
+function zoomAt(sx, sy, factor) {
+  const k0 = mainView.k;
+  const wx = cam.x + sx / k0, wy = cam.y + sy / k0;
+  const z = clampZoom(cam.z * factor);
+  const k1 = baseUnit * z;
+  setCamera(wx - sx / k1, wy - sy / k1, z);
+}
+function animateCamera(to, ms = 300) {
+  const from = { ...cam }, t0 = performance.now();
+  const step = (now) => {
+    const t = Math.min(1, (now - t0) / ms), e = 1 - (1 - t) ** 3;
+    setCamera(from.x + (to.x - from.x) * e, from.y + (to.y - from.y) * e, from.z + (to.z - from.z) * e);
+    if (t < 1) requestAnimationFrame(step);
+    else paintCamera();
+  };
+  requestAnimationFrame(step);
+}
+function loadCamera(id) {
+  try {
+    const c = JSON.parse(localStorage.getItem(`cam:${id}`));
+    if (c && [c.x, c.y, c.z].every(Number.isFinite)) return { x: c.x, y: c.y, z: clampZoom(c.z) };
+  } catch {}
+  return { x: 0, y: 0, z: 1 };
+}
+function saveCamera() {
+  if (!infinite()) return;
+  try { localStorage.setItem(`cam:${state.current.id}`, JSON.stringify(cam)); } catch {}
+}
+function updateZoomLabel() {
+  els.zoomBtn.textContent = `${Math.round(cam.z * 100)} %`;
+}
+
+// Menú de zoom: 100 %, ver todo, volver al inicio
+function viewSize() {
+  return { w: els.canvas.clientWidth, h: els.canvas.clientHeight };
+}
+function zoomTo(z) {
+  const { w, h } = viewSize();
+  const cx = cam.x + w / 2 / mainView.k, cy = cam.y + h / 2 / mainView.k;
+  const k1 = baseUnit * z;
+  animateCamera({ x: cx - w / 2 / k1, y: cy - h / 2 / k1, z });
+}
+function fitAll() {
+  if (!state.items.length) return animateCamera({ x: 0, y: 0, z: 1 });
+  const b = unionBounds(state.items);
+  const { w, h } = viewSize();
+  const bw = Math.max(b.x1 - b.x0, 0.05), bh = Math.max(b.y1 - b.y0, 0.05);
+  const z = clampZoom(Math.min(w / (bw * baseUnit), h / (bh * baseUnit)) * 0.88);
+  const k1 = baseUnit * z;
+  animateCamera({ x: (b.x0 + b.x1) / 2 - w / 2 / k1, y: (b.y0 + b.y1) / 2 - h / 2 / k1, z });
+}
+els.zoomBtn.addEventListener('click', () =>
+  openMenu(els.zoomBtn, [
+    { icon: 'search', label: 'Zoom 100 %', action: () => zoomTo(1) },
+    { icon: 'canvas', label: 'Ver todo', sub: 'Ajusta la vista a lo dibujado', action: fitAll },
+    { icon: 'back', label: 'Volver al inicio del lienzo', action: () => animateCamera({ x: 0, y: 0, z: 1 }) },
+  ])
+);
+
+// Rueda / trackpad (ordenador): desplazar; con Ctrl/⌘ o pellizco del trackpad, zoom
+let wheelTimer = 0;
+els.sheet.addEventListener('wheel', (e) => {
+  if (!infinite() || els.app.dataset.view !== 'note') return;
+  e.preventDefault();
+  const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? els.canvas.clientHeight : 1;
+  const r = viewRect();
+  if (e.ctrlKey || e.metaKey) zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * unit * 0.01));
+  else setCamera(cam.x + (e.deltaX * unit) / mainView.k, cam.y + (e.deltaY * unit) / mainView.k, cam.z);
+  clearTimeout(wheelTimer);
+  wheelTimer = setTimeout(paintCamera, 140);
+}, { passive: false });
 
 function syncCanvasSize() {
-  const rect = els.sheet.getBoundingClientRect();
-  // Si la hoja crece mucho, baja la resolución en lugar de pasarse del límite de memoria del navegador.
-  const dpr = Math.min(window.devicePixelRatio || 1, Math.sqrt(MAX_CANVAS_PX / Math.max(1, rect.width * rect.height)));
-  const w = Math.max(1, Math.round(rect.width * dpr));
-  const h = Math.max(1, Math.round(rect.height * dpr));
-  if (els.canvas.width === w && els.canvas.height === h && canvasNoteId === state.current?.id) return;
-  // Misma nota, mismo ancho y la hoja solo creció hacia abajo: se conserva lo dibujado (copia rápida).
-  const grow = canvasNoteId === state.current?.id && els.canvas.width === w && h > els.canvas.height;
+  const cw = els.canvas.clientWidth, ch = els.canvas.clientHeight;
+  // Notas: si la hoja crece mucho, baja la resolución en lugar de pasarse del límite de memoria del navegador.
+  let dpr = window.devicePixelRatio || 1;
+  if (!infinite()) dpr = Math.min(dpr, Math.sqrt(MAX_CANVAS_PX / Math.max(1, cw * ch)));
+  const w = Math.max(1, Math.round(cw * dpr));
+  const h = Math.max(1, Math.round(ch * dpr));
+  if (els.canvas.width === w && els.canvas.height === h && canvasNoteId === state.current?.id) {
+    refreshView();
+    updatePaper();
+    return;
+  }
+  // Nota que solo creció hacia abajo: se conserva lo dibujado (copia rápida).
+  const grow = !infinite() && canvasNoteId === state.current?.id && els.canvas.width === w && h > els.canvas.height;
   let snap = null;
   if (grow) {
     snap = document.createElement('canvas');
@@ -1827,6 +2011,8 @@ function syncCanvasSize() {
     c.width = w;
     c.height = h;
   }
+  refreshView();
+  updatePaper();
   if (snap) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.drawImage(snap, 0, 0);
@@ -1900,7 +2086,8 @@ function drawShape(c, it) {
 }
 
 function drawSticker(c, it) {
-  const W = c.canvas.width;
+  const v = viewOf(c.canvas);
+  const X = (x) => (x - v.x) * v.s, Y = (y) => (y - v.y) * v.s, W = v.s;
   const { w, h } = stickerSize(it);
   c.save();
   c.setTransform(1, 0, 0, 1, 0, 0);
@@ -1910,14 +2097,14 @@ function drawSticker(c, it) {
     const [, text, color] = it.e.split(':');
     c.fillStyle = color;
     c.beginPath();
-    c.roundRect((it.x - w / 2) * W, (it.y - h / 2) * W, w * W, h * W, (h * W) / 2);
+    c.roundRect(X(it.x - w / 2), Y(it.y - h / 2), w * W, h * W, (h * W) / 2);
     c.fill();
     c.fillStyle = '#fff';
     c.font = `800 ${h * 0.5 * W}px -apple-system, "SF Pro Text", system-ui, sans-serif`;
-    c.fillText(text, it.x * W, (it.y + h * 0.03) * W);
+    c.fillText(text, X(it.x), Y(it.y + h * 0.03));
   } else {
     c.font = `${it.s * 0.82 * W}px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif`;
-    c.fillText(it.e, it.x * W, (it.y + it.s * 0.05) * W);
+    c.fillText(it.e, X(it.x), Y(it.y + it.s * 0.05));
   }
   c.restore();
 }
@@ -1955,8 +2142,8 @@ function clearImageCache() {
 }
 
 function drawImageItem(c, it) {
-  const W = c.canvas.width;
-  const x = it.x * W, y = it.y * W, w = it.w * W, h = it.h * W;
+  const v = viewOf(c.canvas);
+  const x = (it.x - v.x) * v.s, y = (it.y - v.y) * v.s, w = it.w * v.s, h = it.h * v.s;
   const img = imageCache.get(it.f)?.img;
   c.save();
   c.setTransform(1, 0, 0, 1, 0, 0);
@@ -2002,17 +2189,17 @@ function getGrain() {
 // Trazo translúcido: se dibuja opaco en una capa y se compone con la opacidad del lápiz (sin oscurecer los cruces).
 function drawAlphaStroke(it, target = ctx) {
   const pen = penOf(it);
-  const W = target.canvas.width;
+  const v = viewOf(target.canvas);
   const b = bounds(it);
-  const x0 = Math.max(0, Math.floor(b.x0 * W) - 2), y0 = Math.max(0, Math.floor(b.y0 * W) - 2);
-  const x1 = Math.min(target.canvas.width, Math.ceil(b.x1 * W) + 2), y1 = Math.min(target.canvas.height, Math.ceil(b.y1 * W) + 2);
+  const x0 = Math.max(0, Math.floor((b.x0 - v.x) * v.s) - 2), y0 = Math.max(0, Math.floor((b.y0 - v.y) * v.s) - 2);
+  const x1 = Math.min(target.canvas.width, Math.ceil((b.x1 - v.x) * v.s) + 2), y1 = Math.min(target.canvas.height, Math.ceil((b.y1 - v.y) * v.s) + 2);
   const w = x1 - x0, h = y1 - y0;
   if (w <= 0 || h <= 0) return;
   if (layer.width < w) layer.width = w;
   if (layer.height < h) layer.height = h;
   layerCtx.setTransform(1, 0, 0, 1, 0, 0);
   layerCtx.clearRect(0, 0, layer.width, layer.height);
-  layerCtx.setTransform(W, 0, 0, W, -x0, -y0);
+  layerCtx.setTransform(v.s, 0, 0, v.s, -v.x * v.s - x0, -v.y * v.s - y0);
   drawStroke(layerCtx, it);
   if (pen.grain) {
     layerCtx.setTransform(1, 0, 0, 1, -x0, -y0); // el patrón queda anclado al origen de la hoja
@@ -2032,45 +2219,55 @@ function drawCommitted(it, target = ctx) {
   if (!it.t && penOf(it).alpha < 1) {
     drawAlphaStroke(it, target);
   } else {
-    setNormalized(target);
+    applyView(target);
     drawItem(target, it);
   }
 }
 
-// Papel dibujado en un canvas (para exportar PNG); mismas medidas que en pantalla.
-function drawPaper(g, paper, w, h, color) {
-  const u = w / 26;
+// Papel dibujado en un canvas (para exportar PNG), alineado con las coordenadas del mundo como en pantalla.
+function drawPaper(g, paper, w, h, color, v = { s: w, x: 0, y: 0 }) {
+  const U = 1 / 26; // tamaño de la celda en unidades del mundo
+  // Recorre las líneas en  phase + n·period  (mundo) que caen dentro de [0, limit] px
+  const each = (phase, period, origin, limit, fn) => {
+    for (let n = Math.ceil((origin - phase) / period); ; n++) {
+      const px = (phase + n * period - origin) * v.s;
+      if (px > limit) break;
+      fn(px);
+    }
+  };
   g.save();
   g.fillStyle = g.strokeStyle = color;
-  g.lineWidth = Math.max(1, w / 900);
+  g.lineWidth = Math.max(1, (v.s * U) / 30);
   g.beginPath();
   if (paper === 'grid') {
-    for (let x = 0; x <= w; x += u) { g.moveTo(x, 0); g.lineTo(x, h); }
-    for (let y = 0; y <= h; y += u) { g.moveTo(0, y); g.lineTo(w, y); }
+    each(0, U, v.x, w, (x) => { g.moveTo(x, 0); g.lineTo(x, h); });
+    each(0, U, v.y, h, (y) => { g.moveTo(0, y); g.lineTo(w, y); });
     g.stroke();
   } else if (paper === 'lined') {
-    for (let y = u * 0.6 + u * 1.35; y <= h; y += u * 1.35) { g.moveTo(0, y); g.lineTo(w, y); }
+    each(U * 0.6, U * 1.35, v.y, h, (y) => { g.moveTo(0, y); g.lineTo(w, y); });
     g.stroke();
   } else if (paper === 'dots') {
-    const r = Math.max(1.2, w / 700);
-    for (let y = u / 2; y <= h; y += u) for (let x = u / 2; x <= w; x += u) { g.moveTo(x + r, y); g.arc(x, y, r, 0, Math.PI * 2); }
+    const r = Math.max(1.2, (v.s * U) / 22);
+    each(U / 2, U, v.y, h, (y) => each(U / 2, U, v.x, w, (x) => { g.moveTo(x + r, y); g.arc(x, y, r, 0, Math.PI * 2); }));
     g.fill();
   }
   g.restore();
 }
 
 // Dibuja los objetos en un canvas nuevo (miniaturas y exportación). Espera a que carguen las imágenes.
-async function renderDrawing(items, { width, height, ink = null, background = null, paper = null, paperColor = null }) {
+// view: { s, x, y } (px por unidad y origen); por defecto, 1 unidad = el ancho del canvas.
+async function renderDrawing(items, { width, height, view = null, ink = null, background = null, paper = null, paperColor = null }) {
   await Promise.all(items.filter((it) => it.t === 'image').map((it) => loadImage(it.f).catch(() => null)));
   const c = document.createElement('canvas');
   c.width = width;
   c.height = height;
+  if (view) views.set(c, view);
   const g = c.getContext('2d');
   if (background) {
     g.fillStyle = background;
     g.fillRect(0, 0, width, height);
   }
-  if (paper && paper !== 'blank') drawPaper(g, paper, width, height, paperColor || 'rgba(128, 128, 128, 0.2)');
+  if (paper && paper !== 'blank') drawPaper(g, paper, width, height, paperColor || 'rgba(128, 128, 128, 0.2)', viewOf(c));
   const prev = inkOverride;
   inkOverride = ink;
   try {
@@ -2081,16 +2278,34 @@ async function renderDrawing(items, { width, height, ink = null, background = nu
   return c;
 }
 
+function unionBounds(list) {
+  let b = null;
+  for (const it of list) {
+    const q = bounds(it);
+    b = b ? { x0: Math.min(b.x0, q.x0), y0: Math.min(b.y0, q.y0), x1: Math.max(b.x1, q.x1), y1: Math.max(b.y1, q.y1) } : { ...q };
+  }
+  return b;
+}
+
 function redraw() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
-  for (const it of state.items) drawCommitted(it);
+  // Lienzos: solo lo que se ve (con un pequeño margen)
+  const v = mainView, m = 20 / v.k;
+  const vb = infinite() ? { x0: v.x - m, y0: v.y - m, x1: v.x + els.canvas.clientWidth / v.k + m, y1: v.y + els.canvas.clientHeight / v.k + m } : null;
+  for (const it of state.items) {
+    if (vb) {
+      const b = bounds(it);
+      if (b.x1 < vb.x0 || b.x0 > vb.x1 || b.y1 < vb.y0 || b.y0 > vb.y1) continue;
+    }
+    drawCommitted(it);
+  }
 }
 
 // Capa en vivo: trazo/forma en curso o recuadro de selección.
 let liveItem = null;
 
-const pxScale = () => els.canvas.width / (els.sheet.offsetWidth || 1);
+const pxScale = () => mainView.dpr;
 
 function setLiveStyle(pen) {
   els.live.style.opacity = pen ? String(pen.alpha) : '1';
@@ -2105,46 +2320,84 @@ function renderLive() {
   lctx.clearRect(0, 0, els.live.width, els.live.height);
   if (liveItem) {
     setLiveStyle(liveItem.t ? null : penOf(liveItem));
-    setNormalized(lctx);
+    applyView(lctx);
     drawItem(lctx, liveItem);
     els.selUi.hidden = true;
   } else {
     setLiveStyle(null);
-    drawSelection();
+    if (active?.mode === 'lasso') drawLasso();
+    else drawSelection();
   }
 }
 
+// Lazo en curso
+function drawLasso() {
+  const pts = active.pts;
+  if (pts.length < 2) return;
+  const v = mainView, d = v.dpr;
+  lctx.setTransform(1, 0, 0, 1, 0, 0);
+  lctx.beginPath();
+  pts.forEach(([x, y], i) => (i ? lctx.lineTo((x - v.x) * v.s, (y - v.y) * v.s) : lctx.moveTo((x - v.x) * v.s, (y - v.y) * v.s)));
+  lctx.closePath();
+  lctx.fillStyle = 'rgba(10, 132, 255, 0.08)';
+  lctx.fill();
+  lctx.setLineDash([6 * d, 5 * d]);
+  lctx.lineWidth = 1.6 * d;
+  lctx.strokeStyle = '#0a84ff';
+  lctx.stroke();
+  lctx.setLineDash([]);
+  els.selUi.hidden = true;
+}
+
+// Selección (uno o varios objetos): recuadro, asa de escala y botones
+const selItems = () => state.sel.map((i) => state.items[i]).filter(Boolean);
+function setSel(list) {
+  state.sel = [...new Set(list)].filter((i) => state.items[i]).sort((a, b) => a - b);
+}
+
 function drawSelection() {
-  const it = state.tool === 'select' ? state.items[state.sel] : null;
-  if (!it) {
+  const sel = state.tool === 'select' ? selItems() : [];
+  if (!sel.length) {
     els.selUi.hidden = true;
     return;
   }
-  const W = els.live.width;
-  const dpr = pxScale();
-  const b = bounds(it);
-  const pad = 6 * dpr;
-  const x = b.x0 * W - pad, y = b.y0 * W - pad, w = (b.x1 - b.x0) * W + pad * 2, h = (b.y1 - b.y0) * W + pad * 2;
+  const v = mainView, d = v.dpr;
+  const X = (x) => (x - v.x) * v.s, Y = (y) => (y - v.y) * v.s;
   lctx.setTransform(1, 0, 0, 1, 0, 0);
-  lctx.lineWidth = 1.6 * dpr;
+  if (sel.length > 1) {
+    // contorno suave de cada objeto seleccionado
+    lctx.strokeStyle = 'rgba(10, 132, 255, 0.35)';
+    lctx.lineWidth = d;
+    for (const it of sel) {
+      const q = bounds(it);
+      lctx.strokeRect(X(q.x0), Y(q.y0), (q.x1 - q.x0) * v.s, (q.y1 - q.y0) * v.s);
+    }
+  }
+  const b = unionBounds(sel);
+  const pad = 6 * d;
+  const x = X(b.x0) - pad, y = Y(b.y0) - pad, w = (b.x1 - b.x0) * v.s + pad * 2, h = (b.y1 - b.y0) * v.s + pad * 2;
+  lctx.lineWidth = 1.6 * d;
   lctx.strokeStyle = '#0a84ff';
-  lctx.setLineDash([6 * dpr, 4 * dpr]);
+  lctx.setLineDash([6 * d, 4 * d]);
   lctx.beginPath();
-  lctx.roundRect(x, y, w, h, 8 * dpr);
+  lctx.roundRect(x, y, w, h, 8 * d);
   lctx.stroke();
   lctx.setLineDash([]);
   lctx.fillStyle = '#fff';
   lctx.beginPath();
-  lctx.arc(x + w, y + h, 7 * dpr, 0, Math.PI * 2);
+  lctx.arc(x + w, y + h, 7 * d, 0, Math.PI * 2);
   lctx.fill();
   lctx.stroke();
 
-  // botones flotantes sobre el objeto
-  const css = els.sheet.offsetWidth;
-  const top = (y / W) * css;
+  // botones flotantes sobre la selección (px CSS dentro de la hoja / vista), siempre a la vista
+  const viewW = els.canvas.clientWidth, viewH = infinite() ? els.canvas.clientHeight : Infinity;
+  const right = Math.min(viewW - 8, Math.max(140, (x + w) / d));
+  let top = y / d - 46;
+  if (top < 6) top = (y + h) / d + 10;
+  top = Math.min(top, viewH - 52);
   els.selUi.hidden = false;
-  els.selUi.style.left = `${((x + w) / W) * css}px`;
-  els.selUi.style.top = `${top > 52 ? top - 46 : ((y + h) / W) * css + 10}px`;
+  els.selUi.style.left = `${right}px`;
+  els.selUi.style.top = `${Math.max(6, top)}px`;
   els.selUi.style.transform = 'translateX(-100%)';
 }
 
@@ -2172,7 +2425,7 @@ function undo() {
   if (!state.undo.length) return;
   state.redo.push(state.items);
   state.items = state.undo.pop();
-  state.sel = null;
+  state.sel = [];
   redraw();
   commitDrawing();
 }
@@ -2180,7 +2433,7 @@ function redo() {
   if (!state.redo.length) return;
   state.undo.push(state.items);
   state.items = state.redo.pop();
-  state.sel = null;
+  state.sel = [];
   redraw();
   commitDrawing();
 }
@@ -2188,28 +2441,32 @@ els.undo.addEventListener('click', undo);
 els.redo.addEventListener('click', redo);
 
 function deleteSelected() {
-  if (state.sel == null) return;
+  if (!state.sel.length) return;
   pushUndo();
-  state.items = state.items.filter((_, i) => i !== state.sel);
-  state.sel = null;
+  const drop = new Set(state.sel);
+  state.items = state.items.filter((_, i) => !drop.has(i));
+  state.sel = [];
   redraw();
   commitDrawing();
 }
 function duplicateSelected() {
-  const it = state.items[state.sel];
-  if (!it) return;
+  const sel = selItems();
+  if (!sel.length) return;
   pushUndo();
-  state.items = [...state.items, mapItem(it, (x) => x + 0.03, (y) => y + 0.03, 1)];
-  state.sel = state.items.length - 1;
+  const off = 24 / unitPx();
+  const start = state.items.length;
+  state.items = [...state.items, ...sel.map((it) => mapItem(it, (x) => x + off, (y) => y + off, 1))];
+  state.sel = sel.map((_, i) => start + i);
   redraw();
   commitDrawing();
 }
 function sendToBack() {
-  const it = state.items[state.sel];
-  if (!it || state.sel === 0) return;
+  if (!state.sel.length || state.sel.every((i, n) => i === n)) return;
   pushUndo();
-  state.items = [it, ...state.items.filter((_, i) => i !== state.sel)];
-  state.sel = 0;
+  const set = new Set(state.sel);
+  const front = state.items.filter((_, i) => set.has(i));
+  state.items = [...front, ...state.items.filter((_, i) => !set.has(i))];
+  state.sel = front.map((_, i) => i);
   redraw();
   commitDrawing();
 }
@@ -2224,42 +2481,64 @@ document.addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
     e.preventDefault();
     e.shiftKey ? redo() : undo();
-  } else if ((e.key === 'Delete' || e.key === 'Backspace') && state.sel != null) {
+  } else if ((e.key === 'Delete' || e.key === 'Backspace') && state.sel.length) {
     e.preventDefault();
     deleteSelected();
   } else if (e.key === 'Escape') {
     closePop();
-    if (state.sel != null) { state.sel = null; renderLive(); }
+    if (state.sel.length) { state.sel = []; renderLive(); }
   }
 });
 
 // ---------- Entrada con Pencil / ratón / dedo ----------
 
-let active = null; // acción en curso: { id, mode, t, ... }
-let lastPenAt = 0; // última vez que se vio el Pencil (también al pasar sobre la pantalla)
+let active = null;  // acción en curso: { id, mode, t, ... }
+let lastPenAt = 0;  // última vez que se vio el Pencil (también al pasar sobre la pantalla)
 let inertia = 0;
+let gesture = null; // lienzos: dedos desplazando / haciendo zoom { pts: Map(id → [x, y]), base, moved, startX, startY }
 
 const stopInertia = () => cancelAnimationFrame(inertia);
+const pos = (e) => worldAt(e.clientX, e.clientY);
 
-function toPoint(e, rect, prevPressure) {
-  let pressure = e.pressure > 0 ? e.pressure : 0.5;
-  if (prevPressure != null) pressure = prevPressure + (pressure - prevPressure) * 0.5; // suaviza saltos de presión
-  return [round4((e.clientX - rect.left) / rect.width), round4((e.clientY - rect.top) / rect.width), Math.round(pressure * 100) / 100];
+function selectedHandleHit(x, y) {
+  const sel = selItems();
+  if (!sel.length) return false;
+  const b = unionBounds(sel), k = unitPx(), pad = 6 / k;
+  return Math.hypot(x - (b.x1 + pad), y - (b.y1 + pad)) <= 22 / k;
 }
-
-const pos = (e, rect) => [(e.clientX - rect.left) / rect.width, (e.clientY - rect.top) / rect.width];
-
-function selectedHandleHit(x, y, rect) {
-  const it = state.items[state.sel];
-  if (!it) return false;
-  const b = bounds(it);
-  const pad = 6 / rect.width;
-  return Math.hypot(x - (b.x1 + pad), y - (b.y1 + pad)) <= 22 / rect.width;
+function insideSelection(x, y) {
+  const sel = selItems();
+  return sel.length > 0 && inBounds(unionBounds(sel), x, y, 8 / unitPx());
 }
-
-function itemAt(x, y, rect) {
-  for (let i = state.items.length - 1; i >= 0; i--) if (hitItem(state.items[i], x, y, 10 / rect.width, true)) return i;
+function itemAt(x, y) {
+  const r = 10 / unitPx();
+  for (let i = state.items.length - 1; i >= 0; i--) if (hitItem(state.items[i], x, y, r, true)) return i;
   return -1;
+}
+
+// Lazo: punto dentro de un polígono / objeto mayormente dentro del lazo
+function pointInPoly(x, y, P) {
+  let inside = false;
+  for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
+    const [xi, yi] = P[i], [xj, yj] = P[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+function insideLasso(it, P, pb) {
+  const b = bounds(it);
+  if (b.x1 < pb.x0 || b.x0 > pb.x1 || b.y1 < pb.y0 || b.y0 > pb.y1) return false;
+  let pts;
+  if (it.t === 'sticker' || it.t === 'image') pts = [[(b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2]];
+  else if (it.t === 'shape') pts = shapePolys(it).flatMap((poly) => poly.pts);
+  else pts = it.p;
+  const step = Math.max(1, Math.floor(pts.length / 24));
+  let n = 0, k = 0;
+  for (let i = 0; i < pts.length; i += step) {
+    n++;
+    if (pointInPoly(pts[i][0], pts[i][1], P)) k++;
+  }
+  return k / n >= 0.5;
 }
 
 function onCanvasDown(e) {
@@ -2272,39 +2551,127 @@ function onCanvasDown(e) {
     e.preventDefault();
     return;
   }
+  const capture = () => { try { els.canvas.setPointerCapture(e.pointerId); } catch {} };
+  // Lienzos: otro dedo se suma al gesto (dos dedos = zoom)
+  if (e.pointerType === 'touch' && gesture) {
+    e.preventDefault();
+    capture();
+    addTouch(e);
+    return;
+  }
   if (active) {
     if (e.pointerType === 'pen') {
-      // El Pencil siempre tiene prioridad: suelta lo que estuviera en curso (una palma, o un trazo cuyo "levantar" se perdió).
+      // El Pencil siempre tiene prioridad: suelta lo que estuviera en curso (palma, gesto o un trazo sin "levantar").
       if (active.mode === 'pan') active = null;
+      else if (active.mode === 'gesture') endGesture(false);
       else finishAction(false);
+    } else if (e.pointerType === 'touch' && infinite() && active.touch && (active.mode === 'pen' || active.mode === 'shape')) {
+      // Dibujando con el dedo llega un segundo dedo: era un gesto de zoom/desplazamiento (se descarta el trazo).
+      const first = active.touchPos;
+      liveItem = null;
+      active = null;
+      renderLive();
+      e.preventDefault();
+      capture();
+      startGesture(first.id, first.x, first.y);
+      addTouch(e);
+      return;
     } else if (now - active.t > 1500) {
       // Un dedo/ratón que dejó de dar señales: se considera terminado para no bloquear la entrada.
       if (active.mode === 'pan') active = null;
+      else if (active.mode === 'gesture') endGesture(false);
       else finishAction(true);
     } else {
       return;
     }
   }
   e.preventDefault();
-  try { els.canvas.setPointerCapture(e.pointerId); } catch {}
+  capture();
   stopInertia();
+  const [x, y] = pos(e);
 
-  const rect = els.canvas.getBoundingClientRect();
-  const [x, y] = pos(e, rect);
-
-  // Con el dedo solo se desplaza la hoja, salvo para arrastrar lo que ya está seleccionado.
+  // Con el dedo se desplaza (en lienzos también zoom), salvo para arrastrar lo que ya está seleccionado.
   if (e.pointerType === 'touch' && !state.fingerDraws) {
-    const sel = state.tool === 'select' ? state.items[state.sel] : null;
-    const grabbing = sel && (selectedHandleHit(x, y, rect) || hitItem(sel, x, y, 12 / rect.width, true));
+    const grabbing = state.tool === 'select' && (selectedHandleHit(x, y) || insideSelection(x, y));
     if (!grabbing) {
-      active = { id: e.pointerId, mode: 'pan', t: now, startY: e.clientY, lastY: e.clientY, lastT: e.timeStamp, v: 0, moved: false, x, y };
+      if (infinite()) startGesture(e.pointerId, e.clientX, e.clientY);
+      else active = { id: e.pointerId, mode: 'pan', t: now, startY: e.clientY, lastY: e.clientY, lastT: e.timeStamp, v: 0, moved: false, x, y };
       return;
     }
   }
-  beginAction(e, rect, x, y);
-  if (active) active.t = now;
+  beginAction(e, x, y);
+  if (active) {
+    active.t = now;
+    if (e.pointerType === 'touch') {
+      active.touch = true;
+      active.touchPos = { id: e.pointerId, x: e.clientX, y: e.clientY };
+    }
+  }
 }
 els.canvas.addEventListener('pointerdown', onCanvasDown);
+
+// ---------- Gestos con los dedos en lienzos: un dedo desplaza, dos dedos hacen zoom ----------
+function startGesture(id, cx, cy) {
+  gesture = { pts: new Map([[id, [cx, cy]]]), moved: false, startX: cx, startY: cy };
+  active = { id, mode: 'gesture', t: performance.now() };
+  rebaseGesture();
+}
+function addTouch(e) {
+  gesture.pts.set(e.pointerId, [e.clientX, e.clientY]);
+  gesture.moved = true; // con dos dedos ya no es un toque
+  rebaseGesture();
+}
+function gestureFrame() {
+  const r = viewRect();
+  const P = [...gesture.pts.values()];
+  const mid = P.length > 1 ? [(P[0][0] + P[1][0]) / 2 - r.left, (P[0][1] + P[1][1]) / 2 - r.top] : [P[0][0] - r.left, P[0][1] - r.top];
+  const d = P.length > 1 ? Math.hypot(P[0][0] - P[1][0], P[0][1] - P[1][1]) : 0;
+  return { mid, d };
+}
+function rebaseGesture() {
+  const { mid, d } = gestureFrame();
+  gesture.base = { cam: { ...cam }, mid, d };
+}
+function moveGesture(e) {
+  gesture.pts.set(e.pointerId, [e.clientX, e.clientY]);
+  if (active) active.t = performance.now();
+  if (!gesture.moved && Math.hypot(e.clientX - gesture.startX, e.clientY - gesture.startY) < 6) return;
+  gesture.moved = true;
+  const { mid, d } = gestureFrame();
+  const b = gesture.base;
+  const z = d && b.d ? clampZoom(b.cam.z * (d / b.d)) : b.cam.z;
+  const k0 = baseUnit * b.cam.z, k1 = baseUnit * z;
+  // el punto del lienzo que estaba bajo los dedos sigue bajo los dedos
+  const wx = b.cam.x + b.mid[0] / k0, wy = b.cam.y + b.mid[1] / k0;
+  setCamera(wx - mid[0] / k1, wy - mid[1] / k1, z);
+}
+function liftGesture(e) {
+  gesture.pts.delete(e.pointerId);
+  if (gesture.pts.size) {
+    rebaseGesture();
+    if (active?.mode === 'gesture') active.id = gesture.pts.keys().next().value;
+    return;
+  }
+  endGesture(e.type !== 'pointercancel');
+}
+function endGesture(allowTap) {
+  const g = gesture;
+  gesture = null;
+  active = null;
+  if (!g) return;
+  if (g.moved) paintCamera();
+  else if (allowTap) tapWorld(...worldAt(g.startX, g.startY));
+}
+// Toque con el dedo (sin desplazar): seleccionar o colocar un sticker
+function tapWorld(x, y) {
+  if (state.tool === 'select') {
+    const i = itemAt(x, y);
+    setSel(i >= 0 ? [i] : []);
+    renderLive();
+  } else if (state.tool === 'sticker') {
+    placeSticker(x, y);
+  }
+}
 
 // iPadOS: si la página no "reclama" el toque al empezar, Safari puede dárselo a sus propios gestos —Scribble
 // (escritura a texto), doble toque, lupa de selección, desplazamiento, gestos del borde— y cancela o se come
@@ -2341,7 +2708,7 @@ function armHold(a, e) {
 
 function snapToShape(a) {
   if (active !== a || a.mode !== 'pen' || !liveItem || liveItem.sh || liveItem.p.length < 3) return;
-  const W = els.canvas.getBoundingClientRect().width;
+  const W = unitPx();
   const shape = recognizeShape(liveItem.p.map(([x, y]) => [x * W, y * W]));
   if (!shape) return;
   const pressures = liveItem.p.map((p) => p[2]).sort((x, y) => x - y);
@@ -2352,18 +2719,24 @@ function snapToShape(a) {
 
 function placeSticker(x, y) {
   pushUndo();
-  const item = { t: 'sticker', e: state.sticker, x, y, s: 0.11 };
+  // En lienzos se ve del mismo tamaño con cualquier zoom
+  const item = { t: 'sticker', e: state.sticker, x, y, s: round4(0.11 / (infinite() ? cam.z : 1)) };
   const { w, h } = stickerSize(item);
-  item.x = round4(Math.min(Math.max(x, w / 2 + 0.01), 1 - HANDLE_ROOM - w / 2 - 0.01));
-  item.y = round4(Math.max(y, h / 2 + 0.01));
+  if (infinite()) {
+    item.x = round4(x);
+    item.y = round4(y);
+  } else {
+    item.x = round4(Math.min(Math.max(x, w / 2 + 0.01), 1 - HANDLE_ROOM - w / 2 - 0.01));
+    item.y = round4(Math.max(y, h / 2 + 0.01));
+  }
   state.items = [...state.items, item];
-  state.sel = state.items.length - 1;
+  state.sel = [state.items.length - 1];
   redraw();
   setTool('select');
   commitDrawing();
 }
 
-function beginAction(e, rect, x, y) {
+function beginAction(e, x, y) {
   const id = e.pointerId;
   switch (state.tool) {
     case 'pen':
@@ -2372,11 +2745,15 @@ function beginAction(e, rect, x, y) {
       const mode = state.tool === 'eraser' || (e.buttons & 32) ? 'eraser' : 'pen';
       active = { id, mode, undoPushed: false };
       if (mode === 'pen') {
-        liveItem = { k: state.pen, c: state.color, w: round4(PENS[state.pen].w * state.mult), p: [toPoint(e, rect)] };
+        const pr = e.pressure > 0 ? Math.round(e.pressure * 100) / 100 : 0.5;
+        active.sm = [x, y];   // posición estabilizada
+        active.raw = [x, y];  // posición real del lápiz
+        active.lastT = e.timeStamp;
+        liveItem = { k: state.pen, c: state.color, w: round4(PENS[state.pen].w * state.mult), p: [[round4(x), round4(y), pr]] };
         if (state.snapShapes) armHold(active, e);
         renderLive();
       } else {
-        eraseAt(e, rect);
+        eraseAt(e);
       }
       break;
     }
@@ -2389,14 +2766,22 @@ function beginAction(e, rect, x, y) {
       placeSticker(x, y);
       break;
     case 'select': {
-      if (selectedHandleHit(x, y, rect)) {
-        const orig = state.items[state.sel];
-        const b = bounds(orig);
-        active = { id, mode: 'scale', orig, b, ax: b.x0, ay: b.y0, undoPushed: false };
+      // Lazo: asa → escalar · dentro de la selección → mover · sobre un objeto → elegirlo y moverlo · vacío → lazo
+      if (state.sel.length && selectedHandleHit(x, y)) {
+        const orig = selItems();
+        const b = unionBounds(orig);
+        active = { id, mode: 'scale', orig, idx: [...state.sel], b, ax: b.x0, ay: b.y0, undoPushed: false };
+      } else if (state.sel.length && insideSelection(x, y)) {
+        active = { id, mode: 'move', orig: selItems(), idx: [...state.sel], sx: x, sy: y, undoPushed: false };
       } else {
-        const idx = itemAt(x, y, rect);
-        state.sel = idx >= 0 ? idx : null;
-        active = idx >= 0 ? { id, mode: 'move', orig: state.items[idx], sx: x, sy: y, undoPushed: false } : { id, mode: 'none' };
+        const i = itemAt(x, y);
+        if (i >= 0) {
+          setSel([i]);
+          active = { id, mode: 'move', orig: [state.items[i]], idx: [i], sx: x, sy: y, undoPushed: false };
+        } else {
+          setSel([]);
+          active = { id, mode: 'lasso', pts: [[x, y]] };
+        }
         renderLive();
       }
       break;
@@ -2405,9 +2790,9 @@ function beginAction(e, rect, x, y) {
 }
 
 els.canvas.addEventListener('pointermove', (e) => {
+  if (gesture?.pts.has(e.pointerId)) return moveGesture(e);
   if (!active || e.pointerId !== active.id) return;
   active.t = performance.now();
-  const rect = els.canvas.getBoundingClientRect();
 
   switch (active.mode) {
     case 'pan': {
@@ -2424,14 +2809,27 @@ els.canvas.addEventListener('pointermove', (e) => {
       if (liveItem.sh) break; // ya se convirtió en forma: se ignora el resto hasta levantar el lápiz
       const pen = penOf(liveItem);
       const constant = pen.lo === pen.hi;
+      const k = unitPx();
+      // Estabilizador: el trazo sigue al lápiz con un pequeño retardo que alisa el temblor
+      // (constante de tiempo en ms: igual de suave con cualquier frecuencia de muestreo).
+      const tau = state.stabilizer * 70;
       const events = e.getCoalescedEvents?.();
       for (const ev of events?.length ? events : [e]) {
+        const raw = worldAt(ev.clientX, ev.clientY);
+        active.raw = raw;
+        const dt = Math.max(1, ev.timeStamp - active.lastT);
+        active.lastT = Math.max(active.lastT, ev.timeStamp);
+        const a = tau > 0 ? 1 - Math.exp(-dt / tau) : 1;
+        active.sm[0] += (raw[0] - active.sm[0]) * a;
+        active.sm[1] += (raw[1] - active.sm[1]) * a;
         const prev = liveItem.p[liveItem.p.length - 1];
-        const pt = toPoint(ev, rect, prev[2]);
-        if (Math.hypot(pt[0] - prev[0], pt[1] - prev[1]) * rect.width < 0.3) continue;
+        let pr = ev.pressure > 0 ? ev.pressure : 0.5;
+        pr = prev[2] + (pr - prev[2]) * 0.5; // suaviza saltos de presión
+        const pt = [round4(active.sm[0]), round4(active.sm[1]), Math.round(pr * 100) / 100];
+        if (Math.hypot(pt[0] - prev[0], pt[1] - prev[1]) * k < 0.3) continue;
         liveItem.p.push(pt);
         if (!constant) {
-          setNormalized(lctx);
+          applyView(lctx);
           lctx.strokeStyle = resolveColor(liveItem.c);
           lctx.lineCap = 'round';
           strokeSegment(lctx, liveItem, prev, pt);
@@ -2439,17 +2837,19 @@ els.canvas.addEventListener('pointermove', (e) => {
       }
       if (constant) renderLive(); // un solo trazo suavizado (sin uniones visibles)
       if (state.snapShapes && Math.hypot(e.clientX - active.holdX, e.clientY - active.holdY) > HOLD_MOVE_PX) armHold(active, e);
-      const last = liveItem.p[liveItem.p.length - 1];
-      if (last[1] * rect.width > rect.height - 160) extendSheet();
+      if (!infinite()) {
+        const last = liveItem.p[liveItem.p.length - 1];
+        if (last[1] * k > els.canvas.clientHeight - 160) extendSheet();
+      }
       break;
     }
     case 'eraser': {
       const events = e.getCoalescedEvents?.();
-      for (const ev of events?.length ? events : [e]) eraseAt(ev, rect);
+      for (const ev of events?.length ? events : [e]) eraseAt(ev);
       break;
     }
     case 'shape': {
-      let [x, y] = pos(e, rect);
+      let [x, y] = pos(e);
       if (e.shiftKey) {
         const dx = x - liveItem.x1, dy = y - liveItem.y1;
         if (liveItem.s === 'line' || liveItem.s === 'arrow') {
@@ -2464,44 +2864,57 @@ els.canvas.addEventListener('pointermove', (e) => {
       liveItem.x2 = round4(x);
       liveItem.y2 = round4(y);
       renderLive();
-      if (y * rect.width > rect.height - 160) extendSheet();
+      if (!infinite() && y * unitPx() > els.canvas.clientHeight - 160) extendSheet();
+      break;
+    }
+    case 'lasso': {
+      const [x, y] = pos(e);
+      const last = active.pts[active.pts.length - 1];
+      if (Math.hypot(x - last[0], y - last[1]) * unitPx() > 2) {
+        active.pts.push([x, y]);
+        renderLive();
+      }
       break;
     }
     case 'move': {
-      const [x, y] = pos(e, rect);
-      if (!active.undoPushed && Math.hypot(x - active.sx, y - active.sy) * rect.width < 3) break;
-      // Mantén el objeto (y su asa de escala) dentro de la hoja.
-      const b = bounds(active.orig);
-      const dx = Math.max(-b.x0, Math.min(Math.max(0, 1 - HANDLE_ROOM - b.x1), x - active.sx));
-      const dy = Math.max(-b.y0, y - active.sy);
-      applyTransform(active.orig, (v) => v + dx, (v) => v + dy, 1);
+      const [x, y] = pos(e);
+      if (!active.undoPushed && Math.hypot(x - active.sx, y - active.sy) * unitPx() < 3) break;
+      let dx = x - active.sx, dy = y - active.sy;
+      if (!infinite()) {
+        // Notas: la selección (y su asa de escala) se queda dentro de la hoja.
+        const b = unionBounds(active.orig);
+        dx = Math.max(-b.x0, Math.min(Math.max(0, 1 - HANDLE_ROOM - b.x1), dx));
+        dy = Math.max(-b.y0, dy);
+      }
+      applyTransform((v) => v + dx, (v) => v + dy, 1);
       break;
     }
     case 'scale': {
-      const [x, y] = pos(e, rect);
+      const [x, y] = pos(e);
       const hx = active.b.x1 - active.ax, hy = active.b.y1 - active.ay;
-      const kMax = Math.max(0.1, (1 - HANDLE_ROOM - active.ax) / hx);
+      const kMax = infinite() ? 12 : Math.max(0.1, (1 - HANDLE_ROOM - active.ax) / hx);
       const k = Math.max(0.1, Math.min(12, kMax, ((x - active.ax) * hx + (y - active.ay) * hy) / (hx * hx + hy * hy)));
-      applyTransform(active.orig, (v) => active.ax + (v - active.ax) * k, (v) => active.ay + (v - active.ay) * k, k);
+      applyTransform((v) => active.ax + (v - active.ax) * k, (v) => active.ay + (v - active.ay) * k, k);
       break;
     }
   }
 });
 
-function applyTransform(orig, fx, fy, k) {
+// Mueve / escala los objetos seleccionados (desde su estado al empezar el gesto)
+function applyTransform(fx, fy, k) {
   if (!active.undoPushed) {
     pushUndo();
     active.undoPushed = true;
   }
-  const next = mapItem(orig, fx, fy, k);
-  state.items = state.items.map((it, i) => (i === state.sel ? next : it));
+  const next = new Map(active.idx.map((i, n) => [i, mapItem(active.orig[n], fx, fy, k)]));
+  state.items = state.items.map((it, i) => next.get(i) ?? it);
   redraw();
   renderLive();
 }
 
-function eraseAt(e, rect) {
-  const [x, y] = pos(e, rect);
-  const r = 14 / rect.width;
+function eraseAt(e) {
+  const [x, y] = pos(e);
+  const r = 14 / unitPx();
   // Se revisa todo el recorrido desde la posición anterior (no solo el punto actual), para no saltarse
   // trazos finos cuando el Pencil se mueve rápido.
   const from = active.last ?? [x, y];
@@ -2516,18 +2929,22 @@ function eraseAt(e, rect) {
     active.undoPushed = true;
   }
   state.items = kept;
-  state.sel = null;
+  state.sel = [];
   redraw();
 }
 
 function endAction(e) {
+  if (gesture?.pts.has(e.pointerId)) {
+    if (e.type !== 'lostpointercapture') liftGesture(e);
+    return;
+  }
   if (!active || e.pointerId !== active.id) return;
   if (e.type === 'lostpointercapture') {
     // El Pencil reutiliza el mismo pointerId en cada trazo: este aviso del trazo ANTERIOR puede llegar cuando el
-    // siguiente ya empezó, y lo cortaría (se perdía casi todo el trazo al escribir rápido). Para lápiz y
-    // borrador se ignora (si faltara el "levantar", el siguiente trazo cierra el anterior); para lo demás, solo
+    // siguiente ya empezó, y lo cortaría (se perdía casi todo el trazo al escribir rápido). Para lápiz, borrador
+    // y lazo se ignora (si faltara el "levantar", el siguiente trazo cierra el anterior); para lo demás, solo
     // cuenta si de verdad ya no hay captura.
-    if (active.mode === 'pen' || active.mode === 'eraser' || els.canvas.hasPointerCapture?.(e.pointerId)) return;
+    if (['pen', 'eraser', 'lasso'].includes(active.mode) || els.canvas.hasPointerCapture?.(e.pointerId)) return;
   }
   finishAction(e.type === 'pointercancel');
 }
@@ -2536,20 +2953,16 @@ function finishAction(cancelled) {
   const a = active;
   active = null;
   clearTimeout(a.holdTimer);
-  if (a.mode !== 'pan' && a.mode !== 'none') lastStrokeAt = performance.now();
+  if (a.mode !== 'pan' && a.mode !== 'none' && a.mode !== 'gesture') lastStrokeAt = performance.now();
 
   switch (a.mode) {
+    case 'gesture':
+      gesture = null;
+      paintCamera();
+      break;
     case 'pan': {
       if (!a.moved && !cancelled) {
-        // toque con el dedo: seleccionar o colocar sin desplazar
-        if (state.tool === 'select') {
-          const rect = els.canvas.getBoundingClientRect();
-          const idx = itemAt(a.x, a.y, rect);
-          state.sel = idx >= 0 ? idx : null;
-          renderLive();
-        } else if (state.tool === 'sticker') {
-          placeSticker(a.x, a.y);
-        }
+        tapWorld(a.x, a.y); // toque con el dedo: seleccionar o colocar sin desplazar
       } else if (Math.abs(a.v) > 0.05) {
         let v = Math.max(-48, Math.min(48, a.v * 16)); // px por frame, con tope
         const step = () => {
@@ -2564,7 +2977,17 @@ function finishAction(cancelled) {
     case 'pen':
       // Si el sistema cancela el gesto a media palabra, se conserva lo ya dibujado.
       if (liveItem && (!cancelled || liveItem.p.length > 1)) {
-        const item = liveItem.sh ? liveItem : { ...liveItem, p: simplify(liveItem.p, 0.35 / els.sheet.offsetWidth) };
+        // El estabilizador va un poco por detrás del lápiz: el trazo se completa hasta donde se levantó.
+        if (!liveItem.sh && a.raw && state.stabilizer > 0) {
+          const last = liveItem.p[liveItem.p.length - 1];
+          const [rx, ry] = a.raw;
+          const gap = Math.hypot(rx - last[0], ry - last[1]) * unitPx();
+          if (gap > 0.5) {
+            const n = Math.min(6, Math.ceil(gap / 3));
+            for (let i = 1; i <= n; i++) liveItem.p.push([round4(last[0] + ((rx - last[0]) * i) / n), round4(last[1] + ((ry - last[1]) * i) / n), last[2]]);
+          }
+        }
+        const item = liveItem.sh ? liveItem : { ...liveItem, p: simplify(liveItem.p, 0.35 / unitPx()) };
         liveItem = null;
         pushUndo();
         state.items = [...state.items, item];
@@ -2576,18 +2999,34 @@ function finishAction(cancelled) {
       }
       break;
     case 'shape': {
-      const s = liveItem;
+      const sh = liveItem;
       liveItem = null;
-      const rect = els.canvas.getBoundingClientRect();
-      const tiny = Math.hypot(s.x2 - s.x1, s.y2 - s.y1) * rect.width < 8;
+      const tiny = Math.hypot(sh.x2 - sh.x1, sh.y2 - sh.y1) * unitPx() < 8;
       if (!tiny && !cancelled) {
         pushUndo();
-        state.items = [...state.items, s];
-        drawCommitted(s);
+        state.items = [...state.items, sh];
+        drawCommitted(sh);
         commitDrawing();
       } else {
         renderLive();
       }
+      break;
+    }
+    case 'lasso': {
+      const P = a.pts;
+      let len = 0;
+      for (let i = 1; i < P.length; i++) len += Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]);
+      if (!cancelled && len * unitPx() > 20) {
+        const pb = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+        for (const [x, y] of P) {
+          pb.x0 = Math.min(pb.x0, x); pb.x1 = Math.max(pb.x1, x);
+          pb.y0 = Math.min(pb.y0, y); pb.y1 = Math.max(pb.y1, y);
+        }
+        const inside = [];
+        state.items.forEach((it, i) => { if (insideLasso(it, P, pb)) inside.push(i); });
+        setSel(inside);
+      }
+      renderLive();
       break;
     }
     case 'eraser':

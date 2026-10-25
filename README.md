@@ -55,7 +55,9 @@ Las notas se guardan primero **en el dispositivo** (IndexedDB) y se envían al s
 El botón **+** crea:
 
 - **Nota**: título y texto, con el dibujo encima.
-- **Lienzo**: hoja libre para dibujar, con papel en blanco, cuadrícula, rayada o de puntos (selector arriba a la derecha).
+- **Lienzo**: infinito y con zoom, con papel en blanco, cuadrícula, rayada o de puntos (selector arriba a la derecha).
+  - Un dedo desplaza, dos dedos hacen zoom (10 %–800 %); en ordenador, rueda/trackpad para moverse y Ctrl/⌘ + rueda o pellizco para el zoom.
+  - El botón de porcentaje ofrece *Zoom 100 %*, *Ver todo* y *Volver al inicio*. Cada lienzo recuerda su vista.
 
 ## Apple Pencil
 
@@ -64,7 +66,8 @@ El botón **+** crea:
 - **Colores**: 16 colores, "tinta" que se adapta al tema claro/oscuro y selector personalizado.
 - **Formas**: línea, flecha, rectángulo, elipse, triángulo, rombo y estrella, con o sin relleno (con Shift se mantienen proporciones en ratón).
 - **Stickers**: 48 emojis y etiquetas (IDEA, HECHO, URGENTE, TO-DO).
-- **Seleccionar**: mueve, escala (asa en la esquina), duplica, recolorea o elimina cualquier trazo, forma o sticker.
+- **Seleccionar (lazo)**: rodea varios elementos (o toca uno) para moverlos, escalarlos (asa en la esquina), duplicarlos, recolorearlos, enviarlos al fondo o eliminarlos juntos.
+- **Estabilizador** (panel de lápices): suaviza el temblor del trazo; 0 lo desactiva.
 - **Borrador** de trazos completos, deshacer/rehacer y la hoja crece al dibujar cerca del borde inferior.
 - **Rechazo de palma:** mientras escribes con el Pencil, los toques de la mano no seleccionan texto, no desplazan la hoja y no pulsan botones.
 - En una nota, en modo Texto, Scribble de iPadOS convierte tu escritura a texto.
